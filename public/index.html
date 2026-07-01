@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AO3 Translator Export</title>
+  <link rel="stylesheet" href="./styles.css?v=20260701-autosave">
+</head>
+<body>
+  <main class="app">
+    <section class="left">
+      <h1>AO3 Translator Export</h1>
+      <p class="hint">Import AO3 HTML, translate in batches, preview, then export.</p>
+
+      <label class="drop" id="dropZone">
+        <input id="fileInput" type="file" accept=".html,.htm,.xhtml,.epub,text/html,application/epub+zip" multiple>
+        <strong>Choose AO3 HTML / EPUB</strong>
+        <span id="fileMeta">or drag files here</span>
+      </label>
+
+      <div id="workList" class="work-list"></div>
+
+      <label class="field">
+        Translator
+        <select id="providerSelect">
+          <option value="google">Google HTML batch</option>
+          <option value="doubao">Doubao AI translate</option>
+          <option value="deepseek">DeepSeek AI proofread</option>
+        </select>
+      </label>
+
+      <label class="toggle-line google-context-row" id="googleContextRow">
+        <input id="googleContextMode" type="checkbox" checked>
+        <span>Google &#19978;&#19979;&#25991;&#22359;&#32763;&#35793;&#65288;&#22833;&#36133;&#33258;&#21160;&#22238;&#36864;&#65289;</span>
+      </label>
+
+      <div id="aiSettings" class="ai-settings" hidden>
+        <label class="field">AI Key <input id="apiKeyInput" type="password" autocomplete="off" placeholder="DeepSeek / Doubao key"></label>
+        <p id="keyStatus" class="key-status">Checking local key...</p>
+        <details class="advanced-key">
+          <summary>Advanced</summary>
+          <label class="field">Endpoint <input id="endpointInput" value="https://api.deepseek.com/chat/completions"></label>
+          <label class="field">Model <input id="modelInput" value="deepseek-v4-flash"></label>
+        </details>
+      </div>
+
+      <label class="field">
+        Glossary, one per line: original: translation
+        <textarea id="glossaryInput" spellcheck="false">Leon: 里昂
+Leon S. Kennedy: 里昂·S·肯尼迪
+Leon Kennedy: 里昂·肯尼迪
+Rebecca: 瑞贝卡
+Rebecca Chambers: 瑞贝卡·钱伯斯
+Claire: 克莱尔
+Claire Redfield: 克莱尔·雷德菲尔德
+Chris: 克里斯
+Chris Redfield: 克里斯·雷德菲尔德
+Ada: 艾达
+Ada Wong: 艾达·王
+Ashley: 阿什莉
+Ashley Graham: 阿什莉·格拉汉姆
+Jill Valentine: 吉尔·瓦伦丁
+Albert Wesker: 阿尔伯特·威斯克
+Explicit: Explicit
+Mature: Mature
+Teen And Up Audiences: Teen And Up Audiences
+General Audiences: General Audiences
+Not Rated: Not Rated
+M/M: M/M
+F/M: F/M
+F/F: F/F
+Gen: Gen
+Multi: Multi
+Other: Other
+No Archive Warnings Apply: 无AO3警告
+Creator Chose Not To Use Archive Warnings: 作者选择不使用AO3警告
+Graphic Depictions Of Violence: 详细暴力描写
+Major Character Death: 主要角色死亡
+Rape/Non-Con: 强奸/非自愿
+Underage: 未成年
+BSAA: BSAA, keep as-is
+S.T.A.R.S.: S.T.A.R.S., keep as-is
+Raccoon City: 浣熊市</textarea>
+      </label>
+
+      <div class="term-add">
+        <input id="termSourceInput" placeholder="original">
+        <input id="termTargetInput" placeholder="translation">
+        <button id="addTermButton" type="button">Add</button>
+      </div>
+
+      <div class="reader-name-row">
+        <input id="readerNameInput" placeholder="Y/N name">
+        <button id="applyReaderNameButton" type="button">Apply Y/N</button>
+      </div>
+
+      <div class="mini-actions">
+        <button id="presetGlossaryButton" type="button">Add presets</button>
+        <button id="applyGlossaryButton" type="button" disabled>Apply glossary</button>
+      </div>
+
+      <div class="run-actions">
+        <button id="startButton" disabled>Start translate</button>
+        <button id="polishButton" disabled>快速小小润色</button>
+        <button id="doubaoPolishButton" disabled>重新翻译</button>
+        <button id="clearTranslationsButton" type="button" disabled>清空当前译文</button>
+      </div>
+
+      <div class="progress" id="progressBox">
+        <div><span id="progressFill"></span></div>
+        <p id="statusText">Waiting for file.</p>
+      </div>
+
+      <div class="title-panel">
+        <label class="field">Export title <input id="exportTitleInput" placeholder="Clean English title"></label>
+        <button id="titleSuggestButton" type="button" disabled>AI title ideas</button>
+        <div id="titleIdeas" class="title-ideas"></div>
+      </div>
+
+      <div class="exports">
+        <button data-export="bilingual" disabled>Export bilingual HTML (Boox)</button>
+        <button data-export="zh" disabled>Export Chinese HTML (Boox)</button>
+        <button data-export="en" disabled>Export English HTML (Boox)</button>
+        <button data-epub="bilingual" disabled>Export bilingual EPUB</button>
+        <button data-epub="zh" disabled>Export Chinese EPUB</button>
+        <button data-epub="en" disabled>Export English EPUB</button>
+      </div>
+    </section>
+
+    <section class="right">
+      <div class="preview-bar">
+        <div>
+          <h2 id="workTitle">Preview</h2>
+          <p id="workMeta">Import a file first.</p>
+        </div>
+        <div class="modes">
+          <button data-mode="bilingual" class="active">Both</button>
+          <button data-mode="zh">CN</button>
+          <button data-mode="en">EN</button>
+          <button id="togglePreviewButton" type="button" disabled>显示全文预览</button>
+        </div>
+      </div>
+      <article id="preview" class="preview mode-bilingual">
+        <p class="empty">No file yet.</p>
+      </article>
+    </section>
+  </main>
+  <script src="./app.js?v=20260701-autosave" type="module"></script>
+</body>
+</html>
