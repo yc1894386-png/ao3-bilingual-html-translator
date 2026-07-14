@@ -4,18 +4,16 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AO3 Translator Export</title>
-  <link rel="stylesheet" href="./styles.css?v=20260701-autosave">
+  <link rel="stylesheet" href="./styles.css?v=20260713-simple-import-fast-edit">
 </head>
 <body>
   <main class="app">
     <section class="left">
-      <h1>AO3 Translator Export</h1>
-      <p class="hint">Import AO3 HTML, translate in batches, preview, then export.</p>
+      <h1>AO3 Translator</h1>
 
       <label class="drop" id="dropZone">
-        <input id="fileInput" type="file" accept=".html,.htm,.xhtml,.epub,text/html,application/epub+zip" multiple>
-        <strong>Choose AO3 HTML / EPUB</strong>
-        <span id="fileMeta">or drag files here</span>
+        <input id="fileInput" type="file" accept=".html,.htm,.xhtml,.epub,text/html,application/xhtml+xml,application/epub+zip,application/octet-stream" multiple>
+        <strong>Import HTML / EPUB</strong>
       </label>
 
       <div id="workList" class="work-list"></div>
@@ -24,25 +22,28 @@
         Translator
         <select id="providerSelect">
           <option value="google">Google HTML batch</option>
-          <option value="doubao">Doubao AI translate</option>
-          <option value="deepseek">DeepSeek AI proofread</option>
+          <option value="doubao">Doubao / Volcengine AI fallback</option>
+          <option value="deepseek">DeepSeek AI (quota)</option>
         </select>
       </label>
 
-      <label class="toggle-line google-context-row" id="googleContextRow">
-        <input id="googleContextMode" type="checkbox" checked>
-        <span>Google &#19978;&#19979;&#25991;&#22359;&#32763;&#35793;&#65288;&#22833;&#36133;&#33258;&#21160;&#22238;&#36864;&#65289;</span>
-      </label>
+      <details class="side-section">
+        <summary>Settings</summary>
 
-      <div id="aiSettings" class="ai-settings" hidden>
-        <label class="field">AI Key <input id="apiKeyInput" type="password" autocomplete="off" placeholder="DeepSeek / Doubao key"></label>
-        <p id="keyStatus" class="key-status">Checking local key...</p>
-        <details class="advanced-key">
-          <summary>Advanced</summary>
-          <label class="field">Endpoint <input id="endpointInput" value="https://api.deepseek.com/chat/completions"></label>
-          <label class="field">Model <input id="modelInput" value="deepseek-v4-flash"></label>
-        </details>
-      </div>
+        <label class="toggle-line google-context-row" id="googleContextRow">
+          <input id="googleContextMode" type="checkbox" checked>
+          <span>Google &#19978;&#19979;&#25991;&#22359;&#32763;&#35793;&#65288;&#22833;&#36133;&#33258;&#21160;&#22238;&#36864;&#65289;</span>
+        </label>
+
+        <div id="aiSettings" class="ai-settings" hidden>
+          <label class="field">AI Key <input id="apiKeyInput" type="password" autocomplete="off" placeholder="DeepSeek / Doubao key"></label>
+          <p id="keyStatus" class="key-status">Checking local key...</p>
+          <details class="advanced-key">
+            <summary>Advanced</summary>
+            <label class="field">Endpoint <input id="endpointInput" value="https://api.deepseek.com/chat/completions"></label>
+            <label class="field">Model <input id="modelInput" value="deepseek-v4-flash"></label>
+          </details>
+        </div>
 
       <label class="field">
         Glossary, one per line: original: translation
@@ -90,20 +91,28 @@ Raccoon City: 浣熊市</textarea>
       </div>
 
       <div class="reader-name-row">
-        <input id="readerNameInput" placeholder="Y/N name">
+        <input id="readerNameEnInput" placeholder="Y/N English">
+        <input id="readerNameInput" placeholder="Y/N 中文">
         <button id="applyReaderNameButton" type="button">Apply Y/N</button>
       </div>
 
-      <div class="mini-actions">
-        <button id="presetGlossaryButton" type="button">Add presets</button>
-        <button id="applyGlossaryButton" type="button" disabled>Apply glossary</button>
-      </div>
+        <div class="mini-actions">
+          <button id="presetGlossaryButton" type="button">Add presets</button>
+          <button id="applyGlossaryButton" type="button" disabled>Apply glossary</button>
+        </div>
+      </details>
 
       <div class="run-actions">
         <button id="startButton" disabled>Start translate</button>
-        <button id="polishButton" disabled>快速小小润色</button>
-        <button id="doubaoPolishButton" disabled>重新翻译</button>
-        <button id="clearTranslationsButton" type="button" disabled>清空当前译文</button>
+        <button id="stopButton" type="button" disabled>Stop</button>
+        <details class="side-section more-actions">
+          <summary>More actions</summary>
+          <button id="startAllButton" type="button" disabled>Start all</button>
+          <button id="doubaoMissingButton" type="button" disabled>Doubao 补空白</button>
+          <button id="polishButton" disabled>快速小小润色</button>
+          <button id="doubaoPolishButton" disabled>重新翻译</button>
+          <button id="clearTranslationsButton" type="button" disabled>清空当前译文</button>
+        </details>
       </div>
 
       <div class="progress" id="progressBox">
@@ -111,19 +120,25 @@ Raccoon City: 浣熊市</textarea>
         <p id="statusText">Waiting for file.</p>
       </div>
 
-      <div class="title-panel">
-        <label class="field">Export title <input id="exportTitleInput" placeholder="Clean English title"></label>
-        <button id="titleSuggestButton" type="button" disabled>AI title ideas</button>
-        <div id="titleIdeas" class="title-ideas"></div>
-      </div>
+      <details class="side-section export-title-panel" open>
+        <summary>Export title</summary>
+        <div class="title-panel">
+          <label class="field">Export title <input id="exportTitleInput" placeholder="Clean English title"></label>
+          <button id="titleSuggestButton" type="button" disabled>AI title ideas</button>
+          <div id="titleIdeas" class="title-ideas"></div>
+        </div>
+      </details>
 
       <div class="exports">
-        <button data-export="bilingual" disabled>Export bilingual HTML (Boox)</button>
-        <button data-export="zh" disabled>Export Chinese HTML (Boox)</button>
-        <button data-export="en" disabled>Export English HTML (Boox)</button>
-        <button data-epub="bilingual" disabled>Export bilingual EPUB</button>
-        <button data-epub="zh" disabled>Export Chinese EPUB</button>
-        <button data-epub="en" disabled>Export English EPUB</button>
+        <button data-export="bilingual" disabled>Export bilingual HTML</button>
+        <button data-export="zh" disabled>Export Chinese HTML</button>
+        <details class="side-section export-extra">
+          <summary>More exports</summary>
+          <button data-export="en" disabled>Export English HTML</button>
+          <button data-epub="bilingual" disabled>Export bilingual EPUB</button>
+          <button data-epub="zh" disabled>Export Chinese EPUB</button>
+          <button data-epub="en" disabled>Export English EPUB</button>
+        </details>
       </div>
     </section>
 
@@ -137,7 +152,7 @@ Raccoon City: 浣熊市</textarea>
           <button data-mode="bilingual" class="active">Both</button>
           <button data-mode="zh">CN</button>
           <button data-mode="en">EN</button>
-          <button id="togglePreviewButton" type="button" disabled>显示全文预览</button>
+          <button id="togglePreviewButton" type="button" disabled hidden>继续显示更多</button>
         </div>
       </div>
       <article id="preview" class="preview mode-bilingual">
@@ -145,6 +160,6 @@ Raccoon City: 浣熊市</textarea>
       </article>
     </section>
   </main>
-  <script src="./app.js?v=20260701-autosave" type="module"></script>
+  <script src="./app.js?v=20260713-fast-progress-toc-final"></script>
 </body>
 </html>

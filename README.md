@@ -32,6 +32,12 @@ Do not commit `.env` or `.env.local`.
 
 API keys should stay on your own machine.
 
+## Deploy For Phone
+
+[Deploy to Render](https://render.com/deploy?repo=https://github.com/yc1894386-png/ao3-bilingual-html-translator)
+
+Render runs the Node server and gives the app a public HTTPS address. The free service can sleep when idle; opening the address wakes it again.
+
 ## GitHub Pages Note
 
 GitHub Pages can host only static files. This project has a local Node server for translation APIs, so the full translation workflow should be run locally with `npm start`, or deployed later to a backend-capable platform.

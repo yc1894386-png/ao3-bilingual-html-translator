@@ -1,3 +1,74 @@
+﻿if (!window.fetch) {
+  window.fetch = (url, options = {}) => {
+    if (window.XMLHttpRequest) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open(options.method || "GET", url);
+        for (const [key, value] of Object.entries(options.headers || {})) xhr.setRequestHeader(key, value);
+        xhr.onload = () => {
+          const responseText = xhr.responseText || "";
+          resolve({
+            ok: xhr.status >= 200 && xhr.status < 300,
+            status: xhr.status,
+            statusText: xhr.statusText,
+            text: () => Promise.resolve(responseText),
+            json: () => Promise.resolve(responseText ? JSON.parse(responseText) : {})
+          });
+        };
+        xhr.onerror = () => reject(new TypeError("Network request failed."));
+        xhr.send(options.body ?? null);
+      });
+    }
+    if ((options.method || "GET").toUpperCase() !== "POST") {
+      return Promise.reject(new TypeError("This browser can only send POST requests."));
+    }
+    return new Promise((resolve, reject) => {
+      const id = "formFetch" + Date.now() + Math.random().toString(16).slice(2);
+      const iframe = document.createElement("iframe");
+      const form = document.createElement("form");
+      const input = document.createElement("textarea");
+      iframe.name = id;
+      iframe.hidden = true;
+      form.hidden = true;
+      form.method = "POST";
+      form.action = url;
+      form.target = id;
+      form.enctype = "application/x-www-form-urlencoded";
+      input.name = "body";
+      input.value = String(options.body || "");
+      form.appendChild(input);
+      document.body.append(iframe, form);
+      iframe.onload = () => {
+        try {
+          const responseText = iframe.contentDocument?.body?.textContent || "";
+          resolve({
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            text: () => Promise.resolve(responseText),
+            json: () => Promise.resolve(responseText ? JSON.parse(responseText) : {})
+          });
+        } catch (error) {
+          reject(error);
+        } finally {
+          form.remove();
+          iframe.remove();
+        }
+      };
+      form.submit();
+    });
+  };
+}
+document.documentElement.dataset.appJs = "started";
+window.addEventListener("error", (event) => {
+  const status = document.querySelector("#statusText");
+  if (status) status.textContent = `Script error: ${event.message || "unknown"}`;
+});
+window.addEventListener("unhandledrejection", (event) => {
+  const status = document.querySelector("#statusText");
+  if (status) status.textContent = `Script error: ${event.reason?.message || event.reason || "unknown"}`;
+});
+
 const state = {
   fileName: "",
   rawHtml: "",
@@ -14,25 +85,28 @@ const state = {
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
-const PREVIEW_LIMIT = 120;
-const PREVIEW_PAGE_SIZE = 180;
+const PREVIEW_LIMIT = 60;
+const PREVIEW_PAGE_SIZE = 100;
 const GLOSSARY_STORAGE_KEY = "ao3TranslatorGlossary";
 const GOOGLE_CONTEXT_STORAGE_KEY = "ao3GoogleContextMode";
 const READER_NAME_STORAGE_KEY = "ao3TranslatorReaderName";
+const READER_NAME_EN_STORAGE_KEY = "ao3TranslatorReaderNameEn";
 const SESSION_DB_NAME = "ao3TranslatorSessionDb";
 const SESSION_STORE_NAME = "sessions";
 const SESSION_RECORD_KEY = "latest";
 const SESSION_FALLBACK_KEY = "ao3TranslatorSessionFallback";
 const SESSION_FALLBACK_CHUNK_PREFIX = "ao3TranslatorSessionFallbackChunk:";
-const GOOGLE_CONTEXT_MAX_ITEMS = 32;
-const GOOGLE_CONTEXT_MAX_CHARS = 24000;
-const GOOGLE_NORMAL_MAX_ITEMS = 24;
-const GOOGLE_NORMAL_MAX_CHARS = 18000;
-const GOOGLE_FAST_CONCURRENCY = 2;
+const GOOGLE_CONTEXT_MAX_ITEMS = 36;
+const GOOGLE_CONTEXT_MAX_CHARS = 28000;
+const GOOGLE_NORMAL_MAX_ITEMS = 30;
+const GOOGLE_NORMAL_MAX_CHARS = 22000;
+const GOOGLE_FAST_CONCURRENCY = 4;
+const GOOGLE_FAST_SPLIT_ITEMS = 8;
 const AI_CHUNK_LIMITS = {
-  doubao: { maxItems: 5, maxChars: 5600 },
-  deepseek: { maxItems: 8, maxChars: 8500 },
-  polishDoubao: { maxItems: 4, maxChars: 5200 },
+  doubao: { maxItems: 14, maxChars: 16000 },
+  doubaoFallback: { maxItems: 4, maxChars: 4200 },
+  deepseek: { maxItems: 10, maxChars: 10500 },
+  polishDoubao: { maxItems: 2, maxChars: 2600 },
   polishDeepseek: { maxItems: 10, maxChars: 10000 }
 };
 
@@ -40,6 +114,11 @@ const els = {
   fileInput: $("#fileInput"),
   dropZone: $("#dropZone"),
   fileMeta: $("#fileMeta"),
+  latestDownloadButton: $("#latestDownloadButton"),
+  localPathInput: $("#localPathInput"),
+  localPathButton: $("#localPathButton"),
+  importFolderButton: $("#importFolderButton"),
+  importFolderHint: $("#importFolderHint"),
   workList: $("#workList"),
   providerSelect: $("#providerSelect"),
   googleContextMode: $("#googleContextMode"),
@@ -53,11 +132,15 @@ const els = {
   termSourceInput: $("#termSourceInput"),
   termTargetInput: $("#termTargetInput"),
   addTermButton: $("#addTermButton"),
+  readerNameEnInput: $("#readerNameEnInput"),
   readerNameInput: $("#readerNameInput"),
   applyReaderNameButton: $("#applyReaderNameButton"),
   presetGlossaryButton: $("#presetGlossaryButton"),
   applyGlossaryButton: $("#applyGlossaryButton"),
   startButton: $("#startButton"),
+  stopButton: $("#stopButton"),
+  startAllButton: $("#startAllButton"),
+  doubaoMissingButton: $("#doubaoMissingButton"),
   polishButton: $("#polishButton"),
   doubaoPolishButton: $("#doubaoPolishButton"),
   clearTranslationsButton: $("#clearTranslationsButton"),
@@ -80,6 +163,7 @@ let hasServerDoubaoKey = false;
 const selectedSegmentIds = new Set();
 let previewRenderTimer = 0;
 let previewRenderQueued = false;
+let previewEditSaveTimer = 0;
 let workListRenderTimer = 0;
 let lastWorkListKey = "";
 let rawInflateLoader = null;
@@ -87,6 +171,28 @@ let sessionSaveTimer = 0;
 let sessionSaveInFlight = false;
 let sessionSaveAgain = false;
 let restoringSession = false;
+let bulkTranslateMode = false;
+let translationStopRequested = false;
+
+function setStatus(message = "", isError = false) {
+  if (!els.statusText) return;
+  els.statusText.textContent = message;
+  els.statusText.classList.toggle("error", Boolean(isError));
+}
+
+function setProgress(done = 0, total = 0) {
+  const safeDone = Math.max(0, Number(done || 0));
+  const safeTotal = Math.max(0, Number(total || 0));
+  if (els.progressFill) {
+    const percent = safeTotal ? (safeDone / safeTotal) * 100 : 0;
+    els.progressFill.style.width = `${safeDone < safeTotal ? Math.min(99, percent) : 100}%`;
+  }
+}
+
+function setBusy(value) {
+  document.body.classList.toggle("busy", Boolean(value));
+  if (els.stopButton) els.stopButton.disabled = !value;
+}
 
 function isDecorativeText(value = "") {
   const compact = String(value)
@@ -104,7 +210,12 @@ function isDecorativeSegment(segment) {
 
 function isTranslatedSegment(segment) {
   if (isDecorativeSegment(segment)) return true;
-  return Boolean(segment && textOnly(segment.translationHtml || ""));
+  if (!segment) return false;
+  const html = segment.translationHtml || "";
+  if (segment._checkedTranslationHtml === html && typeof segment._isTranslated === "boolean") return segment._isTranslated;
+  segment._checkedTranslationHtml = html;
+  segment._isTranslated = Boolean(html && !isEffectivelyUntranslated(segment, html));
+  return segment._isTranslated;
 }
 
 function rebuildSegmentIndex(work = activeWork()) {
@@ -140,6 +251,7 @@ function safeRenderPreview() {
 }
 
 function schedulePreviewRender(force = false) {
+  if (els.preview?.contains(document.activeElement) && document.activeElement?.closest?.(".zh")) return;
   if (force) {
     if (previewRenderTimer) clearTimeout(previewRenderTimer);
     previewRenderTimer = 0;
@@ -287,6 +399,9 @@ function plainWorkForSave(work) {
       tag: segment.tag,
       kind: segment.kind,
       scope: segment.scope,
+      chapterKey: segment.chapterKey || "",
+      chapterTitle: segment.chapterTitle || "",
+      chapterOrder: segment.chapterOrder || 0,
       originalHtml: segment.originalHtml,
       originalText: segment.originalText,
       decorative: Boolean(segment.decorative),
@@ -407,8 +522,8 @@ function setActiveWork(index) {
   setStatus(work.status || `Opened ${work.fileName}.`);
   updateReady();
   scheduleWorkListRender(true);
-  schedulePreviewRender(true);
-  scheduleSessionSave();
+  if (!bulkTranslateMode) schedulePreviewRender(true);
+  scheduleSessionSave(bulkTranslateMode ? 4000 : 900);
 }
 
 function syncActiveWork() {
@@ -422,7 +537,7 @@ function syncActiveWork() {
   work.selectedIds = [...selectedSegmentIds];
   work.progressDone = state.segments.filter(isTranslatedSegment).length;
   work.progressTotal = state.segments.length;
-  scheduleSessionSave();
+  scheduleSessionSave((bulkTranslateMode || document.body.classList.contains("busy")) ? 4000 : 900);
 }
 
 function updateFileMeta() {
@@ -433,7 +548,7 @@ function updateFileMeta() {
   }
   if (state.works.length === 1) {
     const work = state.works[0];
-    els.fileMeta.textContent = work.sizeKb ? `${work.fileName} · ${work.sizeKb} KB` : work.fileName;
+    els.fileMeta.textContent = work.sizeKb ? `${work.fileName} - ${work.sizeKb} KB` : work.fileName;
     return;
   }
   els.fileMeta.textContent = `${state.works.length} works loaded`;
@@ -461,20 +576,20 @@ function resetActiveWork(message = "No file loaded.") {
 
 function removeWork(index) {
   if (document.body.classList.contains("busy") && index === state.currentWorkIndex) {
-    setStatus("翻译/润色还在运行，先等它结束再删除作品。", true);
+    setStatus("Translation is still running. Stop or wait before deleting this work.", true);
     return;
   }
   const work = state.works[index];
   if (!work) return;
   const title = work.metadata?.title || work.fileName || `Work ${index + 1}`;
-  const confirmed = window.confirm(`删除「${title}」？\n\n只会从当前网页列表移除，不会删除你电脑里的原 HTML 文件。`);
+  const confirmed = window.confirm(`Delete "${title}" from this page?\n\nThis will not delete the original file from your computer.`);
   if (!confirmed) return;
 
   if (index === state.currentWorkIndex) selectedSegmentIds.clear();
   state.works.splice(index, 1);
 
   if (!state.works.length) {
-    resetActiveWork(`已删除「${title}」。`);
+    resetActiveWork(`Deleted "${title}".`);
     return;
   }
 
@@ -487,7 +602,7 @@ function removeWork(index) {
   }
   updateFileMeta();
   scheduleSessionSave(100);
-  setStatus(`已删除「${title}」。`);
+  setStatus(`Deleted "${title}".`);
 }
 
 const providerDefaults = {
@@ -505,295 +620,7 @@ const providerDefaults = {
   }
 };
 
-const legacyPresets = [
-  ["Leon", "里昂"],
-  ["Leon S. Kennedy", "里昂·S·肯尼迪"],
-  ["Leon Kennedy", "里昂·肯尼迪"],
-  ["Rebecca", "瑞贝卡"],
-  ["Rebecca Chambers", "瑞贝卡·钱伯斯"],
-  ["Claire", "克莱尔"],
-  ["Ada Wong", "艾达·王"],
-  ["Ada", "艾达"],
-  ["Ashley", "阿什莉"],
-  ["Ashley Graham", "阿什莉·格拉汉姆"],
-  ["Luis Serra", "路易斯·塞拉"],
-  ["Luis", "路易斯"],
-  ["Claire Redfield", "克莱尔·雷德菲尔德"],
-  ["Chris", "克里斯"],
-  ["Chris Redfield", "克里斯·雷德菲尔德"],
-  ["Jill", "吉尔"],
-  ["Jill Valentine", "吉尔·瓦伦丁"],
-  ["Wesker", "威斯克"],
-  ["Albert Wesker", "阿尔伯特·威斯克"],
-  ["Sherry", "雪莉"],
-  ["Sherry Birkin", "雪莉·柏金"],
-  ["William Birkin", "威廉·柏金"],
-  ["Annette Birkin", "安妮特·柏金"],
-  ["Carlos Oliveira", "卡洛斯·奥利维拉"],
-  ["Barry Burton", "巴瑞·伯顿"],
-  ["HUNK", "汉克"],
-  ["Luis Serra Navarro", "路易斯·塞拉·纳瓦罗"],
-  ["Ingrid Hunnigan", "英格丽·哈尼根"],
-  ["President Graham", "格拉汉姆总统"],
-  ["Raccoon City", "浣熊市"],
-  ["Umbrella", "安布雷拉"],
-  ["Umbrella Corporation", "安布雷拉公司"],
-  ["Spencer Mansion", "斯宾塞洋馆"],
-  ["RPD", "RPD, keep as-is"],
-  ["Raccoon Police Department", "浣熊市警察局"],
-  ["Arklay Mountains", "阿克雷山"],
-  ["Arklay Laboratory", "阿克雷研究所"],
-  ["Rockfort Island", "洛克福特岛"],
-  ["Kijuju", "基祖祖"],
-  ["Tall Oaks", "高橡市"],
-  ["Las Plagas", "拉斯普拉加斯"],
-  ["BSAA", "BSAA, keep as-is"],
-  ["S.T.A.R.S.", "S.T.A.R.S., keep as-is"],
-  ["D.S.O.", "D.S.O., keep as-is"],
-  ["Blue Umbrella", "蓝色安布雷拉"],
-  ["T-virus", "T病毒"],
-  ["G-virus", "G病毒"],
-  ["C-virus", "C病毒"],
-  ["Plaga", "普拉卡"],
-  ["B.O.W.", "B.O.W., keep as-is"],
-  ["bio-organic weapon", "生化有机武器"],
-  ["Ganado", "村民 / 加纳多, by context"],
-  ["Majini", "马基尼"],
-  ["Licker", "舔食者"],
-  ["Tyrant", "暴君"],
-  ["Nemesis", "追迹者"],
-  ["Regenerator", "再生者"],
-  ["rookie cop", "菜鸟警察 / 新人警察, by context"],
-  ["government agent", "政府特工"],
-  ["agent", "特工"],
-  ["partner", "搭档"],
-  ["mission", "任务"],
-  ["safehouse", "安全屋"],
-  ["knife", "匕首"],
-  ["handgun", "手枪"],
-  ["shotgun", "霰弹枪"],
-  ["magnum", "马格南"],
-  ["sweetheart", "亲爱的 / 甜心, by voice"],
-  ["honey", "亲爱的 / 宝贝, by voice"],
-  ["baby", "宝贝, by voice"],
-  ["good boy", "乖孩子 / 好孩子, by tone"]
-  ,
-  ["Explicit", "Explicit"],
-  ["Mature", "Mature"],
-  ["Teen And Up Audiences", "Teen And Up Audiences"],
-  ["General Audiences", "General Audiences"],
-  ["Not Rated", "Not Rated"],
-  ["M/M", "M/M"],
-  ["F/M", "F/M"],
-  ["F/F", "F/F"],
-  ["Gen", "Gen"],
-  ["Multi", "Multi"],
-  ["No Archive Warnings Apply", "无AO3警告"],
-  ["Creator Chose Not To Use Archive Warnings", "作者选择不使用AO3警告"],
-  ["Graphic Depictions Of Violence", "详细暴力描写"],
-  ["Major Character Death", "主要角色死亡"],
-  ["Rape/Non-Con", "强奸/非自愿"],
-  ["Underage", "未成年"],
-  ["Complete Work", "已完结"],
-  ["Work in Progress", "连载中"],
-  ["English", "英语"],
-  ["Words", "字数"],
-  ["Chapters", "章节"],
-  ["Comments", "评论"],
-  ["Kudos", "赞"],
-  ["Bookmarks", "书签"],
-  ["Hits", "点击"]
-  ,
-  ["Additional Tags", "附加标签"],
-  ["Archive Warnings", "AO3警告"],
-  ["Category", "分类"],
-  ["Fandom", "圈子"],
-  ["Relationship", "关系"],
-  ["Relationships", "关系"],
-  ["Characters", "角色"],
-  ["Freeform", "自由标签"],
-  ["Rating", "分级"],
-  ["Language", "语言"],
-  ["Published", "发布"],
-  ["Updated", "更新"],
-  ["Status", "状态"],
-  ["Series", "系列"],
-  ["Summary", "简介"],
-  ["Notes", "作者的话"],
-  ["Chapter", "章节"],
-  ["Chapter Text", "正文"],
-  ["End Notes", "章末备注"],
-  ["Inspired by", "灵感来源"],
-  ["Part", "第"],
-  ["Fluff", "甜饼"],
-  ["Angst", "虐"],
-  ["Hurt/Comfort", "伤痛/慰藉"],
-  ["Comfort", "慰藉"],
-  ["Hurt No Comfort", "只有伤痛没有慰藉"],
-  ["Smut", "肉"],
-  ["Porn", "肉"],
-  ["Porn With Plot", "有剧情的肉"],
-  ["Porn Without Plot", "无剧情纯肉"],
-  ["Plot What Plot/Porn Without Plot", "无剧情纯肉"],
-  ["PWP", "PWP, keep as-is"],
-  ["Explicit Sexual Content", "露骨性内容"],
-  ["Sexual Content", "性内容"],
-  ["First Time", "第一次"],
-  ["First Kiss", "初吻"],
-  ["Kissing", "接吻"],
-  ["Making Out", "热吻"],
-  ["Blow Jobs", "口交"],
-  ["Hand Jobs", "手交"],
-  ["Oral Sex", "口交"],
-  ["Anal Sex", "肛交"],
-  ["Rimming", "舔肛"],
-  ["Come Eating", "吞精"],
-  ["Barebacking", "无套"],
-  ["Rough Sex", "粗暴性爱"],
-  ["Soft Sex", "温柔性爱"],
-  ["Dom/sub", "支配/臣服"],
-  ["BDSM", "BDSM, keep as-is"],
-  ["Bondage", "束缚"],
-  ["Aftercare", "事后安抚"],
-  ["Dirty Talk", "下流话"],
-  ["Praise Kink", "夸奖癖"],
-  ["Size Kink", "体型差癖"],
-  ["Possessive Behavior", "占有欲"],
-  ["Jealousy", "嫉妒"],
-  ["Mutual Pining", "双向暗恋"],
-  ["Pining", "暗恋"],
-  ["Slow Burn", "慢热"],
-  ["Friends to Lovers", "朋友变恋人"],
-  ["Enemies to Lovers", "敌人变恋人"],
-  ["Rivals to Lovers", "对手变恋人"],
-  ["Established Relationship", "已确立关系"],
-  ["Getting Together", "在一起"],
-  ["Confessions", "告白"],
-  ["Love Confessions", "告白"],
-  ["Developing Relationship", "关系发展"],
-  ["Misunderstandings", "误会"],
-  ["Unresolved Sexual Tension", "未解决的性张力"],
-  ["UST", "UST, keep as-is"],
-  ["Emotional Hurt/Comfort", "情感伤痛/慰藉"],
-  ["Protective", "保护欲"],
-  ["Protective Leon S. Kennedy", "保护欲强的里昂·S·肯尼迪"],
-  ["Protective Rebecca Chambers", "保护欲强的瑞贝卡·钱伯斯"],
-  ["Bottom Leon S. Kennedy", "Bottom里昂·S·肯尼迪"],
-  ["Top Leon S. Kennedy", "Top里昂·S·肯尼迪"],
-  ["Bottom Rebecca Chambers", "Bottom瑞贝卡·钱伯斯"],
-  ["Top Rebecca Chambers", "Top瑞贝卡·钱伯斯"],
-  ["Alternate Universe", "AU"],
-  ["Alternate Universe - Canon Divergence", "AU-原作分歧"],
-  ["Canon Divergence", "原作分歧"],
-  ["Canon Compliant", "遵循原作"],
-  ["Post-Canon", "原作后"],
-  ["Pre-Canon", "原作前"],
-  ["Missing Scene", "缺失场景"],
-  ["Fix-It", "修正原作"],
-  ["Modern AU", "现代AU"],
-  ["College AU", "大学AU"],
-  ["No Beta We Die Like Men", "无beta校对"],
-  ["No beta we die like men", "无beta校对"],
-  ["Not Beta Read", "未经beta校对"],
-  ["Beta Read", "已beta校对"],
-  ["One Shot", "一发完"],
-  ["Drabble", "短打"],
-  ["POV", "视角"],
-  ["POV Leon S. Kennedy", "里昂·S·肯尼迪视角"],
-  ["POV Rebecca Chambers", "瑞贝卡·钱伯斯视角"],
-  ["Happy Ending", "HE"],
-  ["Bad Ending", "BE"],
-  ["Open Ending", "开放式结局"],
-  ["Dead Dove: Do Not Eat", "Dead Dove: Do Not Eat, keep as-is"],
-  ["Dubious Consent", "模糊同意"],
-  ["Dubcon", "Dubcon, keep as-is"],
-  ["Non-Consensual", "非自愿"],
-  ["Consent Issues", "同意问题"],
-  ["Blood and Injury", "血与伤"],
-  ["Blood", "血"],
-  ["Injury", "受伤"],
-  ["Violence", "暴力"],
-  ["Graphic Violence", "详细暴力"],
-  ["Trauma", "创伤"],
-  ["PTSD", "PTSD, keep as-is"],
-  ["Nightmares", "噩梦"],
-  ["Panic Attacks", "惊恐发作"],
-  ["Alcohol", "酒精"],
-  ["Drinking", "饮酒"],
-  ["Humor", "幽默"],
-  ["Crack", "沙雕"],
-  ["Crack Treated Seriously", "沙雕设定正经写"],
-  ["Domestic Fluff", "居家甜饼"],
-  ["Bed Sharing", "同床"],
-  ["Sharing a Bed", "同床"],
-  ["Cuddling", "拥抱贴贴"],
-  ["Touch-Starved", "肌肤饥渴"],
-  ["Protective Behavior", "保护行为"],
-  ["Emotional Sex", "情感性爱"],
-  ["Plot", "剧情"]
-  ,
-  ["Alpha/Beta/Omega Dynamics", "ABO设定"],
-  ["Omegaverse", "Omegaverse, keep as-is"],
-  ["Alpha", "Alpha, keep as-is"],
-  ["Beta", "Beta, keep as-is"],
-  ["Omega", "Omega, keep as-is"],
-  ["Heat", "发情期"],
-  ["Rut", "易感期"],
-  ["Mpreg", "男男生子"],
-  ["Pregnancy", "怀孕"],
-  ["Kid Fic", "带娃"],
-  ["Found Family", "找到的家人"],
-  ["Soulmates", "灵魂伴侣"],
-  ["Soulmate AU", "灵魂伴侣AU"],
-  ["Time Travel", "时间旅行"],
-  ["Time Loop", "时间循环"],
-  ["Fix-It of Sorts", "某种意义上的修正原作"],
-  ["Reader", "读者"],
-  ["Reader-Insert", "读者插入"],
-  ["You", "你"],
-  ["Original Character(s)", "原创角色"],
-  ["Original Character", "原创角色"],
-  ["OC", "OC, keep as-is"],
-  ["Self-Insert", "自我代入"],
-  ["Age Difference", "年龄差"],
-  ["Age Gap", "年龄差"],
-  ["Character Death", "角色死亡"],
-  ["Temporary Character Death", "临时角色死亡"],
-  ["Past Character Death", "过去角色死亡"],
-  ["Major Injuries", "重伤"],
-  ["Minor Injuries", "轻伤"],
-  ["Medical Procedures", "医疗处理"],
-  ["Hospital", "医院"],
-  ["Recovery", "恢复期"],
-  ["Slow Build", "慢慢发展"],
-  ["Tension", "张力"],
-  ["Sexual Tension", "性张力"],
-  ["Emotional Constipation", "情感便秘"],
-  ["Feelings Realization", "意识到感情"],
-  ["Idiots in Love", "恋爱笨蛋"],
-  ["They Are Idiots", "他们是笨蛋"],
-  ["Secret Relationship", "秘密恋情"],
-  ["Fake/Pretend Relationship", "假装情侣"],
-  ["Fake Relationship", "假装情侣"],
-  ["Mutual Masturbation", "互相自慰"],
-  ["Masturbation", "自慰"],
-  ["Fingerfucking", "手指插入"],
-  ["Fingering", "手指插入"],
-  ["Praise", "夸奖"],
-  ["Degradation", "羞辱"],
-  ["Light Bondage", "轻度束缚"],
-  ["Knifeplay", "刀具play"],
-  ["Bloodplay", "血play"],
-  ["Comeplay", "精液play"],
-  ["Overstimulation", "过度刺激"],
-  ["Orgasm Delay/Denial", "高潮延迟/禁止"],
-  ["Aftermath", "事后"],
-  ["Morning After", "第二天早上"],
-  ["Angst with a Happy Ending", "有HE的虐"],
-  ["Bittersweet Ending", "苦甜结局"]
-];
-
-const presets = [
+const corePresets = [
   ["Leon", "里昂"],
   ["Leon S. Kennedy", "里昂·S·肯尼迪"],
   ["Leon Kennedy", "里昂·肯尼迪"],
@@ -809,366 +636,47 @@ const presets = [
   ["Ashley Graham", "阿什莉·格拉汉姆"],
   ["Luis", "路易斯"],
   ["Luis Serra", "路易斯·塞拉"],
-  ["Luis Serra Navarro", "路易斯·塞拉·纳瓦罗"],
-  ["Jill", "吉尔"],
-  ["Jill Valentine", "吉尔·瓦伦丁"],
   ["Wesker", "威斯克"],
   ["Albert Wesker", "阿尔伯特·威斯克"],
-  ["Sherry", "雪莉"],
-  ["Sherry Birkin", "雪莉·柏金"],
-  ["William Birkin", "威廉·柏金"],
-  ["Annette Birkin", "安妮特·柏金"],
-  ["Carlos Oliveira", "卡洛斯·奥利维拉"],
-  ["Barry Burton", "巴瑞·伯顿"],
-  ["HUNK", "汉克"],
-  ["Ingrid Hunnigan", "英格丽·哈尼根"],
-  ["President Graham", "格拉汉姆总统"],
   ["Raccoon City", "浣熊市"],
-  ["Umbrella", "安布雷拉"],
-  ["Umbrella Corporation", "安布雷拉公司"],
-  ["Blue Umbrella", "蓝色安布雷拉"],
-  ["RPD", "RPD, keep as-is"],
-  ["Raccoon Police Department", "浣熊市警察局"],
-  ["Arklay Mountains", "阿克雷山区"],
-  ["Arklay Laboratory", "阿克雷研究所"],
-  ["Spencer Mansion", "斯宾塞洋馆"],
-  ["Rockfort Island", "洛克福特岛"],
-  ["Kijuju", "基祖祖"],
-  ["Tall Oaks", "高橡市"],
-  ["Las Plagas", "拉斯普拉卡斯"],
-  ["Plaga", "普拉卡"],
-  ["Ganado", "村民 / 加纳多, by context"],
-  ["Majini", "马基尼"],
-  ["Licker", "舔食者"],
-  ["Tyrant", "暴君"],
-  ["Nemesis", "追踪者"],
-  ["Regenerator", "再生者"],
-  ["B.O.W.", "B.O.W., keep as-is"],
-  ["bio-organic weapon", "生化有机武器"],
-  ["T-virus", "T病毒"],
-  ["G-virus", "G病毒"],
-  ["C-virus", "C病毒"],
-  ["BSAA", "BSAA, keep as-is"],
-  ["S.T.A.R.S.", "S.T.A.R.S., keep as-is"],
-  ["D.S.O.", "D.S.O., keep as-is"],
-  ["rookie cop", "菜鸟警察 / 新人警察, by context"],
-  ["government agent", "政府特工"],
-  ["agent", "特工"],
-  ["partner", "搭档"],
-  ["mission", "任务"],
-  ["safehouse", "安全屋"],
-  ["knife", "匕首"],
-  ["handgun", "手枪"],
-  ["shotgun", "霰弹枪"],
-  ["magnum", "马格南"],
-  ["sweetheart", "亲爱的 / 甜心, by voice"],
-  ["honey", "亲爱的 / 宝贝, by voice"],
-  ["baby", "宝贝, by voice"],
-  ["good boy", "乖孩子 / 好孩子, by tone"],
-  ["Explicit", "Explicit"],
-  ["Mature", "Mature"],
-  ["Teen And Up Audiences", "Teen And Up Audiences"],
-  ["General Audiences", "General Audiences"],
-  ["Not Rated", "Not Rated"],
-  ["M/M", "M/M"],
-  ["F/M", "F/M"],
-  ["F/F", "F/F"],
-  ["Gen", "Gen"],
-  ["Multi", "Multi"],
-  ["Other", "Other"],
+  ["BSAA", "BSAA"],
+  ["S.T.A.R.S.", "S.T.A.R.S."],
+  ["Omega", "Omega"],
+  ["Alpha", "Alpha"],
+  ["Beta", "Beta"],
+  ["omega", "omega"],
+  ["alpha", "alpha"],
+  ["beta", "beta"],
+  ["zombies", "丧尸"],
+  ["zoobies", "丧尸"],
+  ["zoobie", "丧尸"],
+  ["sister", "妹妹"],
+  ["Sergeant", "中士"],
+  ["captain", "队长"],
+  ["Elpis", "厄尔庇斯"],
+  ["M/M", "男/男"],
+  ["F/M", "女/男"],
+  ["F/F", "女/女"],
+  ["Gen", "无CP"],
+  ["Explicit", "成人级"],
+  ["Mature", "成熟级"],
+  ["Teen And Up Audiences", "青少年及以上"],
+  ["Archive Warning", "AO3警告"],
   ["No Archive Warnings Apply", "无AO3警告"],
-  ["Creator Chose Not To Use Archive Warnings", "作者选择不使用AO3警告"],
-  ["Graphic Depictions Of Violence", "详细暴力描写"],
-  ["Major Character Death", "主要角色死亡"],
-  ["Rape/Non-Con", "强奸/非自愿"],
-  ["Underage", "未成年"],
-  ["Complete Work", "已完结"],
-  ["Work in Progress", "连载中"],
-  ["English", "英语"],
-  ["Words", "字数"],
-  ["Chapters", "章节"],
-  ["Comments", "评论"],
-  ["Kudos", "赞"],
-  ["Bookmarks", "书签"],
-  ["Hits", "点击"],
-  ["Additional Tags", "附加标签"],
-  ["Archive Warnings", "AO3警告"],
-  ["Category", "分类"],
-  ["Fandom", "圈子"],
-  ["Relationship", "关系"],
-  ["Relationships", "关系"],
-  ["Characters", "角色"],
-  ["Freeform", "自由标签"],
-  ["Rating", "分级"],
-  ["Language", "语言"],
-  ["Published", "发布"],
-  ["Updated", "更新"],
-  ["Status", "状态"],
-  ["Series", "系列"],
-  ["Summary", "简介"],
-  ["Notes", "作者的话"],
-  ["Chapter", "章节"],
-  ["Chapter Text", "正文"],
-  ["End Notes", "章末备注"],
-  ["Inspired by", "灵感来源"],
-  ["Part", "第"],
-  ["Fluff", "甜饼"],
-  ["Angst", "虐"],
-  ["Hurt/Comfort", "伤痛/慰藉"],
-  ["Comfort", "慰藉"],
-  ["Hurt No Comfort", "只有伤痛没有慰藉"],
-  ["Smut", "肉"],
-  ["Porn", "肉"],
-  ["Porn With Plot", "有剧情的肉"],
-  ["Porn Without Plot", "无剧情纯肉"],
-  ["Plot What Plot/Porn Without Plot", "无剧情纯肉"],
-  ["PWP", "PWP, keep as-is"],
-  ["Explicit Sexual Content", "露骨性内容"],
-  ["Sexual Content", "性内容"],
-  ["First Time", "第一次"],
-  ["First Kiss", "初吻"],
-  ["Kissing", "接吻"],
-  ["Making Out", "热吻"],
-  ["Blow Jobs", "口交"],
-  ["Hand Jobs", "手交"],
-  ["Oral Sex", "口交"],
-  ["Anal Sex", "肛交"],
-  ["Rimming", "舔肛"],
-  ["Come Eating", "吞精"],
-  ["Barebacking", "无套"],
-  ["Rough Sex", "粗暴性爱"],
-  ["Soft Sex", "温柔性爱"],
-  ["Dom/sub", "支配/臣服"],
-  ["BDSM", "BDSM, keep as-is"],
-  ["Bondage", "束缚"],
-  ["Aftercare", "事后安抚"],
-  ["Dirty Talk", "下流话"],
-  ["Praise Kink", "夸奖癖"],
-  ["Size Kink", "体型差癖"],
-  ["Possessive Behavior", "占有欲"],
-  ["Jealousy", "嫉妒"],
-  ["Mutual Pining", "双向暗恋"],
-  ["Pining", "暗恋"],
-  ["Slow Burn", "慢热"],
-  ["Friends to Lovers", "朋友变恋人"],
-  ["Enemies to Lovers", "敌人变恋人"],
-  ["Rivals to Lovers", "对手变恋人"],
-  ["Established Relationship", "已确立关系"],
-  ["Getting Together", "在一起"],
-  ["Confessions", "告白"],
-  ["Love Confessions", "告白"],
-  ["Developing Relationship", "关系发展"],
-  ["Misunderstandings", "误会"],
-  ["Unresolved Sexual Tension", "未解决的性张力"],
-  ["UST", "UST, keep as-is"],
-  ["Emotional Hurt/Comfort", "情感伤痛/慰藉"],
-  ["Protective", "保护欲"],
-  ["Protective Leon S. Kennedy", "保护欲强的里昂·S·肯尼迪"],
-  ["Protective Rebecca Chambers", "保护欲强的瑞贝卡·钱伯斯"],
-  ["Bottom Leon S. Kennedy", "Bottom 里昂·S·肯尼迪"],
-  ["Top Leon S. Kennedy", "Top 里昂·S·肯尼迪"],
-  ["Bottom Rebecca Chambers", "Bottom 瑞贝卡·钱伯斯"],
-  ["Top Rebecca Chambers", "Top 瑞贝卡·钱伯斯"],
-  ["Alternate Universe", "AU"],
-  ["Alternate Universe - Canon Divergence", "AU-原作分歧"],
-  ["Canon Divergence", "原作分歧"],
-  ["Canon Compliant", "遵循原作"],
-  ["Post-Canon", "原作之后"],
-  ["Pre-Canon", "原作之前"],
-  ["Missing Scene", "缺失场景"],
-  ["Fix-It", "修正原作"],
-  ["Modern AU", "现代AU"],
-  ["College AU", "大学AU"],
-  ["No Beta We Die Like Men", "无beta校对"],
-  ["No beta we die like men", "无beta校对"],
-  ["Not Beta Read", "未经beta校对"],
-  ["Beta Read", "已beta校对"],
-  ["One Shot", "一发完"],
-  ["Drabble", "短打"],
-  ["POV", "视角"],
-  ["POV Leon S. Kennedy", "里昂·S·肯尼迪视角"],
-  ["POV Rebecca Chambers", "瑞贝卡·钱伯斯视角"],
-  ["Happy Ending", "HE"],
-  ["Bad Ending", "BE"],
-  ["Open Ending", "开放式结局"],
-  ["Dead Dove: Do Not Eat", "Dead Dove: Do Not Eat, keep as-is"],
-  ["Dubious Consent", "模糊同意"],
-  ["Dubcon", "Dubcon, keep as-is"],
-  ["Non-Consensual", "非自愿"],
-  ["Consent Issues", "同意问题"],
-  ["Blood and Injury", "血与伤"],
-  ["Blood", "血"],
-  ["Injury", "受伤"],
-  ["Violence", "暴力"],
-  ["Graphic Violence", "详细暴力"],
-  ["Trauma", "创伤"],
-  ["PTSD", "PTSD, keep as-is"],
-  ["Nightmares", "噩梦"],
-  ["Panic Attacks", "惊恐发作"],
-  ["Alcohol", "酒精"],
-  ["Drinking", "饮酒"],
-  ["Humor", "幽默"],
-  ["Crack", "沙雕"],
-  ["Crack Treated Seriously", "沙雕设定正经写"],
-  ["Domestic Fluff", "居家甜饼"],
-  ["Bed Sharing", "同床"],
-  ["Sharing a Bed", "同床"],
-  ["Cuddling", "拥抱贴贴"],
-  ["Touch-Starved", "肌肤饥渴"],
-  ["Protective Behavior", "保护行为"],
-  ["Emotional Sex", "情感性爱"],
-  ["Plot", "剧情"],
-  ["Alpha/Beta/Omega Dynamics", "ABO设定"],
-  ["Omegaverse", "Omegaverse, keep as-is"],
-  ["Alpha", "Alpha, keep as-is"],
-  ["Beta", "Beta, keep as-is"],
-  ["Omega", "Omega, keep as-is"],
-  ["Heat", "发情期"],
-  ["Rut", "易感期"],
-  ["Mpreg", "男男生子"],
-  ["Pregnancy", "怀孕"],
-  ["Kid Fic", "带娃"],
-  ["Found Family", "找到的家人"],
-  ["Soulmates", "灵魂伴侣"],
-  ["Soulmate AU", "灵魂伴侣AU"],
-  ["Time Travel", "时间旅行"],
-  ["Time Loop", "时间循环"],
-  ["Fix-It of Sorts", "某种意义上的修正原作"],
-  ["Reader", "读者"],
-  ["Reader-Insert", "读者插入"],
-  ["You", "你"],
-  ["Original Character(s)", "原创角色"],
-  ["Original Character", "原创角色"],
-  ["OC", "OC, keep as-is"],
-  ["Self-Insert", "自我代入"],
-  ["Age Difference", "年龄差"],
-  ["Age Gap", "年龄差"],
-  ["Character Death", "角色死亡"],
-  ["Temporary Character Death", "临时角色死亡"],
-  ["Past Character Death", "过去角色死亡"],
-  ["Major Injuries", "重伤"],
-  ["Minor Injuries", "轻伤"],
-  ["Medical Procedures", "医疗处理"],
-  ["Hospital", "医院"],
-  ["Recovery", "恢复期"],
-  ["Slow Build", "慢慢发展"],
-  ["Tension", "张力"],
-  ["Sexual Tension", "性张力"],
-  ["Emotional Constipation", "情感便秘"],
-  ["Feelings Realization", "意识到感情"],
-  ["Idiots in Love", "恋爱笨蛋"]
+  ["force", "按语境：强迫 / 用力 / 迫使"],
+  ["forced", "按语境：被迫 / 强迫"],
+  ["forze", "按语境：force 拼写错误，通常译作强迫/用力"],
+  ["frozen", "按语境：僵住 / 冻僵 / 冰冷"],
+  ["forzen", "按语境：frozen 拼写错误，通常译作僵住/冻僵"],
+  ["move", "按语境：走 / 动身 / 快走 / 移动"],
+  ["let's move", "走吧 / 快走"],
 ];
 
-function setStatus(text, isError = false) {
-  els.statusText.textContent = text;
-  els.statusText.classList.toggle("error", isError);
-  const work = activeWork();
-  if (work) {
-    work.status = text;
-    work.statusIsError = isError;
-  }
-}
-
-function setProgress(done, total) {
-  const percent = total ? Math.round((done / total) * 100) : 0;
-  els.progressFill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
-  const work = activeWork();
-  if (work) {
-    work.progressDone = done;
-    work.progressTotal = total;
-  }
-  scheduleWorkListRender();
-}
-
-function setBusy(value) {
-  document.body.classList.toggle("busy", Boolean(value));
-}
-
-function handleRuntimeFault(error) {
-  console.error("AO3 translator runtime fault", error);
-  scheduleSessionSave(50);
-  if (els.statusText) {
-    setStatus("The page hit a small crash, but your work is being saved locally. Refresh once to restore.", true);
-  }
-}
-
-window.addEventListener("error", (event) => {
-  handleRuntimeFault(event.error || event.message);
-});
-
-window.addEventListener("unhandledrejection", (event) => {
-  handleRuntimeFault(event.reason || "Unhandled promise rejection.");
-});
-
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden") {
-    saveActiveSelection();
-    void saveSessionNow();
-  }
-});
-
-window.addEventListener("beforeunload", () => {
-  saveActiveSelection();
-  void saveSessionNow();
-});
-
-function updateAiSettings() {
-  const provider = els.providerSelect.value;
-  const defaults = providerDefaults[provider] || providerDefaults.deepseek;
-  if (defaults.endpoint && (!els.endpointInput.value.trim() || els.endpointInput.dataset.provider !== provider)) {
-    els.endpointInput.value = defaults.endpoint;
-  }
-  if (defaults.model && (!els.modelInput.value.trim() || els.modelInput.dataset.provider !== provider)) {
-    els.modelInput.value = defaults.model;
-  }
-  els.endpointInput.dataset.provider = provider;
-  els.modelInput.dataset.provider = provider;
-  const hasTypedKey = Boolean(els.apiKeyInput.value.trim());
-  if (provider === "google") {
-    els.aiSettings.hidden = true;
-    els.keyStatus.textContent = "";
-    if (els.googleContextRow) els.googleContextRow.hidden = false;
-  } else if (provider === "doubao") {
-    if (els.googleContextRow) els.googleContextRow.hidden = true;
-    els.aiSettings.hidden = hasServerDoubaoKey || hasTypedKey;
-    els.keyStatus.textContent = hasServerDoubaoKey ? "Local Doubao key connected." : "Paste Doubao API Key here.";
-  } else if (provider === "deepseek") {
-    if (els.googleContextRow) els.googleContextRow.hidden = true;
-    els.aiSettings.hidden = hasServerDeepSeekKey || hasTypedKey;
-    els.keyStatus.textContent = hasServerDeepSeekKey ? "Local DeepSeek key connected." : "Paste DeepSeek API Key here.";
-  }
-}
-
-function revealKeySettings(provider = "deepseek") {
-  els.providerSelect.value = provider;
-  updateAiSettings();
-  els.aiSettings.hidden = false;
-  els.apiKeyInput.focus();
-}
-
-function escapeHtml(value = "") {
-  return String(value).replace(/[&<>"']/g, (char) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    "\"": "&quot;",
-    "'": "&#39;"
-  }[char]));
-}
-
-function textOnly(html = "") {
-  const div = document.createElement("div");
-  div.innerHTML = html;
-  return div.textContent.replace(/\s+/g, " ").trim();
-}
-
-function defaultGlossaryText() {
-  return presets.map(([source, target]) => `${source}: ${target}`).join("\n");
-}
+const legacyPresets = corePresets;
+const presets = corePresets;
 
 function looksMojibake(value = "") {
-  const text = String(value);
-  return /�|锟|閲屾槀|鐟炶礉|鑹捐揪|闃夸粈|濞佹柉|浣滆|绔犺|娴ｇ唺|璀﹀憡/.test(text);
+  return false;
 }
 
 function textWithBreaks(html = "") {
@@ -1178,6 +686,21 @@ function textWithBreaks(html = "") {
     .replace(/<\/p\s*>/gi, "\n")
     .replace(/<\/div\s*>/gi, "\n");
   return div.textContent.replace(/[ \t]+/g, " ").replace(/\n\s+/g, "\n").trim();
+}
+
+function textOnly(html = "") {
+  const div = document.createElement("div");
+  div.innerHTML = String(html || "");
+  return (div.textContent || "").replace(/\s+/g, " ").trim();
+}
+
+function escapeHtml(value = "") {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function innerHtml(html = "") {
@@ -1270,10 +793,67 @@ function markAo3ChapterTitles(root) {
   });
 }
 
+function chapterContainerForNode(node) {
+  const chapter = node.closest?.("section.chapter, article.chapter, .chapter, [id^='chapter-']");
+  if (!chapter || chapter.closest(".summary, .notes, dl.meta, .meta, #footer, .navigation, .actions, .landmark")) return null;
+  return chapter;
+}
+
+function ao3FlowChapterMarkerForNode(node) {
+  const root = node.closest?.("#chapters");
+  if (!root) return null;
+  let child = node;
+  while (child && child.parentElement !== root) child = child.parentElement;
+  if (!child) child = node.closest?.(".userstuff, .meta.group, blockquote, div, section, article") || node;
+  for (let cursor = child; cursor; cursor = cursor.previousElementSibling) {
+    if (!cursor.matches?.(".meta.group")) continue;
+    const heading = cursor.querySelector("h1.heading, h2.heading, h3.heading, .heading, h1, h2, h3");
+    const title = cleanExportText(heading?.textContent || "");
+    if (title && !/^(summary|notes?|chapter text|work text|preface|end notes?)$/i.test(title)) return cursor;
+  }
+  return null;
+}
+
+function chapterTitleFromAo3Marker(marker) {
+  const heading = marker?.querySelector?.("h1.heading, h2.heading, h3.heading, .heading, h1, h2, h3");
+  const text = cleanExportText(heading?.textContent || "");
+  if (!text || text.length > 160) return "";
+  if (/^(summary|notes?|chapter text|work text|preface|end notes?)$/i.test(text)) return "";
+  return text;
+}
+
+function chapterTitleFromContainer(chapter) {
+  const heading = chapter?.querySelector?.("[data-ao3-chapter-title='1'], h1.title, h2.title, h3.title, .title, h1, h2, h3");
+  const text = cleanExportText(heading?.textContent || "");
+  if (!text || text.length > 160) return "";
+  if (/^(summary|notes?|chapter text|work text|preface|end notes?)$/i.test(text)) return "";
+  return text;
+}
+
+function ao3FlowChapterBlockCount(doc) {
+  let count = 0;
+  for (const root of doc.querySelectorAll("#chapters")) {
+    let hasOpenChapter = false;
+    for (const child of root.children) {
+      if (child.matches?.(".meta.group")) {
+        if (chapterTitleFromAo3Marker(child)) hasOpenChapter = true;
+        continue;
+      }
+      if (hasOpenChapter && child.matches?.(".userstuff, blockquote, div, section, article")) {
+        if (translatableNodes(child).length) {
+          count += 1;
+          hasOpenChapter = false;
+        }
+      }
+    }
+  }
+  return count;
+}
+
 function splitLongHtmlPart(html) {
   const text = textOnly(html);
   if (text.length <= 1800 || /<[^>]+>/.test(html)) return [html];
-  const sentences = html.match(/[^.!?。！？]+[.!?。！？]["'”’)]?\s*|[^.!?。！？]+$/g) || [html];
+  const sentences = html.match(/[^.!?\u3002\uff01\uff1f]+[.!?\u3002\uff01\uff1f"']?\s*|[^.!?\u3002\uff01\uff1f]+$/g) || [html];
   const parts = [];
   let current = "";
   for (const sentence of sentences) {
@@ -1387,6 +967,12 @@ function segmentKeyForNode(node, counters = new Map()) {
   return `${base}|${count}`;
 }
 
+function segmentOriginalHtml(node) {
+  if (segmentKind(node) !== "meta") return node.outerHTML;
+  const tag = node.tagName.toLowerCase();
+  return "<" + tag + ">" + escapeHtml(normalizedSegmentText(node)) + "</" + tag + ">";
+}
+
 function segmentIdentity(segment = {}) {
   return [
     segment.kind || "",
@@ -1435,11 +1021,22 @@ function segmentForExportNode(node, index, lookup, usedIds, counters) {
 }
 
 const requiredGlossaryTerms = [
+  ["Leon S. Kennedy/Reader", "\u91cc\u6602\u00b7S\u00b7\u80af\u5c3c\u8fea / \u8bfb\u8005"],
+  ["Leon Kennedy/Reader", "\u91cc\u6602\u00b7\u80af\u5c3c\u8fea / \u8bfb\u8005"],
   ["Leon", "\u91cc\u6602"],
   ["Leon S. Kennedy", "\u91cc\u6602\u00b7S\u00b7\u80af\u5c3c\u8fea"],
   ["Leon Kennedy", "\u91cc\u6602\u00b7\u80af\u5c3c\u8fea"],
   ["Rebecca", "\u745e\u8d1d\u5361"],
   ["Rebecca Chambers", "\u745e\u8d1d\u5361\u00b7\u94b1\u4f2f\u65af"],
+  ["Omega", "omega"],
+  ["Alpha", "alpha"],
+  ["Beta", "beta"],
+  ["omegas", "omegas"],
+  ["alphas", "alphas"],
+  ["betas", "betas"],
+  ["omega", "omega"],
+  ["alpha", "alpha"],
+  ["beta", "beta"],
   ["zombies", "\u4e27\u5c38"],
   ["zoobies", "\u4e27\u5c38"],
   ["zoobie", "\u4e27\u5c38"],
@@ -1468,7 +1065,7 @@ function parseGlossary() {
 function cleanGlossaryTarget(target = "") {
   const raw = String(target || "").trim();
   if (/keep as-is|\u4e0d\u7ffb\u8bd1/i.test(raw)) return "";
-  const first = raw.split(/[?,;?]|\s+\/\s+/)[0].trim();
+  const first = raw.split(/[\uFF0C,;\uFF1B]|\s+\/\s+/)[0].trim();
   if (!first || /context|voice|tone|\u6309\u8bed\u5883|\u6309\u89d2\u8272|by /i.test(first)) return "";
   return first;
 }
@@ -1488,32 +1085,141 @@ function glossaryTargetForExactText(text = "") {
 function localMetaTranslation(segment) {
   if (segment.kind !== "meta") return "";
   const target = glossaryTargetForExactText(segment.originalText);
-  return target ? "<" + (segment.tag || "span") + ">" + escapeHtml(target) + "</" + (segment.tag || "span") + ">" : "";
+  return target ? localTranslationHtml(segment, target) : "";
 }
 
-function localShortTextTranslation(segment) {
-  if (segment.kind !== "body") return "";
-  const normalized = String(segment.originalText || "").replace(/\s+/g, " ").trim();
-  if (isReaderNamePlaceholder(normalized)) {
-    const name = readerName();
-    return name ? "<" + (segment.tag || "p") + ">" + escapeHtml(name) + "</" + (segment.tag || "p") + ">" : "";
-  }
-  const compact = normalized
-    .toLowerCase()
-    .replace(/\[\s*/g, "[ ")
-    .replace(/\s*\]/g, " ]")
+function looksLikeLeakedAo3Href(text = "") {
+  return /%[0-9a-f]{2}|\*s\*|\*d\*|\/works\b|["']\s*>|&quot;\s*&gt;|&#34;\s*&gt;/i.test(String(text || ""));
+}
+
+function localTranslationHtml(segment, target = "") {
+  const doc = new DOMParser().parseFromString(segment?.originalHtml || "", "text/html");
+  const node = doc.body.firstElementChild;
+  const text = preserveSystemOrnaments(segment?.originalText || "", target);
+  if (!node) return "<" + (segment?.tag || "p") + ">" + escapeHtml(text) + "</" + (segment?.tag || "p") + ">";
+  node.textContent = text;
+  return node.outerHTML;
+}
+
+function preserveSystemOrnaments(original = "", target = "") {
+  const source = String(original || "").trim();
+  let output = String(target || "");
+  const leading = source.match(/^[^\w\u4e00-\u9fff\[]+/u)?.[0]?.trim();
+  const trailing = source.match(/[^\w\u4e00-\u9fff\]]+$/u)?.[0]?.trim();
+  if (leading && /[^\s()[\]{}"'`.,:;!?-]/u.test(leading)) output = leading + " " + output;
+  if (trailing && trailing !== leading && /[^\s()[\]{}"'`.,:;!?-]/u.test(trailing)) output += " " + trailing;
+  return output;
+}
+
+function stripSystemPrefix(value = "") {
+  return String(value)
+    .replace(/^[^A-Za-z0-9\[]+/g, "")
+    .replace(/^[\s\[\](!)\u26a0\u25b2-]+/g, "")
     .replace(/\s+/g, " ")
     .trim();
-  const tight = compact.replace(/\s+/g, "");
+}
+
+function translateSystemQuote(value = "") {
+  const text = String(value || "").trim();
+  const exact = new Map([
+    ["are you kidding me, leon?", "\u4f60\u5728\u5f00\u73a9\u7b11\u5427\uff0c\u91cc\u6602\uff1f"]
+  ]);
+  return exact.get(text.toLowerCase()) || text;
+}
+
+function translateSystemShortText(normalized = "") {
+  const plain = stripSystemPrefix(normalized)
+    .toLowerCase()
+    .replace(/\s*[-\u2013\u2014]+\s*$/g, "")
+    .replace(/[.\u3002]+$/g, "")
+    .trim();
+  const tight = plain.replace(/\s+/g, "");
+  const key = stripSystemPrefix(normalized)
+    .toLowerCase()
+    .replace(/[\u201c\u201d]/g, "\"")
+    .replace(/^[\s\[\](!)\u26a0\u25b2-]+|[\s\[\](!)\u26a0\u25b2-]+$/g, "")
+    .replace(/\s*[-\u2013\u2014]+\s*$/g, "")
+    .replace(/[.\u3002]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const keyTight = key.replace(/\s+/g, "");
+  const currentLevel2 = key.match(/^current level:\s*["']?(.+?)["']?$/i);
+  if (currentLevel2) return "\u5f53\u524d\u7b49\u7ea7\uff1a\u201c" + translateSystemQuote(currentLevel2[1]) + "\u201d";
+  const systemStatus2 = key.match(/^system:\s*(.+)$/i);
+  if (systemStatus2) {
+    const value = systemStatus2[1].trim();
+    if (value === "anomaly detected") return "\u7cfb\u7edf\uff1a\u68c0\u6d4b\u5230\u5f02\u5e38";
+    return "\u7cfb\u7edf\uff1a" + value;
+  }
+  const looseMap = new Map([
+    ["sweetheart syndrome", "\u751c\u5fc3\u7efc\u5408\u5f81"],
+    ["reminder:", "\u63d0\u9192\uff1a"],
+    ["reminder", "\u63d0\u9192\uff1a"],
+    ["system: anomaly detected", "\u7cfb\u7edf\uff1a\u68c0\u6d4b\u5230\u5f02\u5e38"],
+    ["anomaly detected", "\u68c0\u6d4b\u5230\u5f02\u5e38"]
+  ]);
+  if (looseMap.has(key)) return looseMap.get(key);
+  if (looseMap.has(keyTight)) return looseMap.get(keyTight);
+  const currentLevel = plain.replace(/[鈥溾€漖/g, "\"").match(/^current level:\s*["']?(.+?)["']?$/i);
+  if (currentLevel) return "\u5f53\u524d\u7b49\u7ea7\uff1a\u201c" + translateSystemQuote(currentLevel[1]) + "\u201d";
+  const systemStatus = plain.match(/^system:\s*(.+)$/i);
+  if (systemStatus) {
+    const value = systemStatus[1].replace(/[.\u3002]+$/g, "").trim();
+    if (value === "anomaly detected") return "\u7cfb\u7edf\uff1a\u68c0\u6d4b\u5230\u5f02\u5e38";
+    return "\u7cfb\u7edf\uff1a" + value;
+  }
+  const dateMatch = plain.match(/^([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,\s*(\d{4})$/i);
+  const months = {
+    january: "1", february: "2", march: "3", april: "4", may: "5", june: "6",
+    july: "7", august: "8", september: "9", october: "10", november: "11", december: "12"
+  };
+  if (dateMatch && months[dateMatch[1]]) {
+    return dateMatch[3] + "\u5e74" + months[dateMatch[1]] + "\u6708" + dateMatch[2] + "\u65e5";
+  }
+  const progress = normalized.match(/(\d{1,3})\s*%/);
+  if (progress && normalized.length <= 80) return progress[1] + "%";
+  if (/\[\s*yes\s*\].*[\[\s]no\s*\]/i.test(normalized)) return "[\u662f] [\u5426]";
+  if (/\[\s*yes\s*\]/i.test(normalized)) return "[\u662f]";
+  if (/\[\s*no\s*\]/i.test(normalized)) return "[\u5426]";
+  if (/^\d+\s*\.{1,3}$/.test(plain)) return plain.replace(/\./g, "\u2026");
   const map = new Map([
     ["yes", "\u662f"],
     ["no", "\u5426"],
     ["[ yes ] [ no ]", "[\u662f] [\u5426]"],
     ["[yes][no]", "[\u662f] [\u5426]"],
+    ["yes|no", "[\u662f] [\u5426]"],
     ["do you want to restart?", "\u662f\u5426\u91cd\u65b0\u5f00\u59cb\uff1f"],
     ["doyouwanttorestart?", "\u662f\u5426\u91cd\u65b0\u5f00\u59cb\uff1f"],
     ["critical error", "\u4e25\u91cd\u9519\u8bef"],
     ["criticalerror", "\u4e25\u91cd\u9519\u8bef"],
+    ["memory analysis", "\u8bb0\u5fc6\u5206\u6790\u4e2d\u2026\u2026"],
+    ["memory analysis...", "\u8bb0\u5fc6\u5206\u6790\u4e2d\u2026\u2026"],
+    ["operating system corrupted", "\u64cd\u4f5c\u7cfb\u7edf\u5df2\u635f\u574f\u3002"],
+    ["error correction", "\u9519\u8bef\u4fee\u6b63\u4e2d\u2026\u2026"],
+    ["error correction...", "\u9519\u8bef\u4fee\u6b63\u4e2d\u2026\u2026"],
+    ["repairing errors", "\u6b63\u5728\u4fee\u590d\u9519\u8bef\u2026\u2026"],
+    ["repairing errors...", "\u6b63\u5728\u4fee\u590d\u9519\u8bef\u2026\u2026"],
+    ["repairing errors in progress", "\u9519\u8bef\u4fee\u590d\u8fdb\u884c\u4e2d\u2026\u2026"],
+    ["connection interrupted due to failure", "\u8fde\u63a5\u56e0\u6545\u969c\u4e2d\u65ad"],
+    ["data recovery failed", "\u6570\u636e\u6062\u590d\u5931\u8d25\u3002"],
+    ["restarting in 3", "3\u79d2\u540e\u91cd\u542f\u2026\u2026"],
+    ["restarting in 3...", "3\u79d2\u540e\u91cd\u542f\u2026\u2026"],
+    ["location not registered", "\u4f4d\u7f6e\u672a\u6ce8\u518c\u3002"],
+    ["visual glitch detected -- correcting", "\u68c0\u6d4b\u5230\u89c6\u89c9\u6545\u969c\u2014\u2014\u6b63\u5728\u4fee\u6b63\u2026\u2026"],
+    ["visual glitch detected -- correcting...", "\u68c0\u6d4b\u5230\u89c6\u89c9\u6545\u969c\u2014\u2014\u6b63\u5728\u4fee\u6b63\u2026\u2026"],
+    ["temporary memory corrupted", "\u4e34\u65f6\u8bb0\u5fc6\u5df2\u635f\u574f\u3002"],
+    ["skipping is not recommended", "\u4e0d\u5efa\u8bae\u8df3\u8fc7\u2014\u2014"],
+    ["connection stabilized", "\u8fde\u63a5\u5df2\u7a33\u5b9a"],
+    ["welcome, user", "\u6b22\u8fce\uff0c\u7528\u6237\u3002"],
+    ["progress system activated", "\u8fdb\u5ea6\u7cfb\u7edf\u5df2\u542f\u52a8\u3002"],
+    ["inventory -- accessible at any time", "\u3010\u7269\u54c1\u680f\u3011\u2014\u2014\u968f\u65f6\u53ef\u7528\u3002"],
+    ["upgrade store -- unlocked", "\u3010\u5347\u7ea7\u5546\u5e97\u3011\u2014\u2014\u5df2\u89e3\u9501\u3002"],
+    ["available skills:", "\u53ef\u7528\u6280\u80fd\uff1a"],
+    ["health:", "\u751f\u547d\uff1a"],
+    ["stamina:", "\u8010\u529b\uff1a"],
+    ["new objective:", "\u65b0\u76ee\u6807\uff1a"],
+    ["alteration detected", "\u68c0\u6d4b\u5230\u5f02\u53d8"],
+    ["error 404: inadmissible character", "\u9519\u8bef 404\uff1a\u4e0d\u53ef\u63a5\u53d7\u5b57\u7b26"],
     ["restart", "\u91cd\u65b0\u5f00\u59cb"],
     ["continue", "\u7ee7\u7eed"],
     ["game over", "\u6e38\u620f\u7ed3\u675f"],
@@ -1523,46 +1229,94 @@ function localShortTextTranslation(segment) {
     ["error", "\u9519\u8bef"],
     ["warning", "\u8b66\u544a"]
   ]);
-  const target = map.get(compact) || map.get(tight);
-  return target ? "<" + (segment.tag || "p") + ">" + escapeHtml(target) + "</" + (segment.tag || "p") + ">" : "";
+  return map.get(plain) || map.get(tight) || "";
+}
+
+function localShortTextTranslation(segment) {
+  if (segment.kind !== "body") return "";
+  const normalized = String(segment.originalText || "").replace(/\s+/g, " ").trim();
+  if (isReaderNamePlaceholder(normalized)) {
+    const name = readerNameZh();
+    return name ? "<" + (segment.tag || "p") + ">" + escapeHtml(name) + "</" + (segment.tag || "p") + ">" : "";
+  }
+  const compact = normalized
+    .toLowerCase()
+    .replace(/\[\s*/g, "[ ")
+    .replace(/\s*\]/g, " ]")
+    .replace(/\s+/g, " ")
+    .trim();
+  const tight = compact.replace(/\s+/g, "");
+  const target = translateSystemShortText(compact) || translateSystemShortText(tight);
+  return target ? localTranslationHtml(segment, target) : "";
+}
+
+function readerNameZh() {
+  return (els.readerNameInput?.value || "").replace(/\s+/g, " ").trim();
+}
+
+function readerNameEn() {
+  return (els.readerNameEnInput?.value || "").replace(/\s+/g, " ").trim();
 }
 
 function readerName() {
-  return (els.readerNameInput?.value || "").replace(/\s+/g, " ").trim();
+  return readerNameZh();
 }
 
 function isReaderNamePlaceholder(value = "") {
   return /^[\[(\s{]*y\s*[\/\\]\s*n[\])\s}]*$/i.test(String(value || "").trim());
 }
 
-function applyReaderNameToText(value = "") {
-  const name = readerName();
+function hasReaderNamePlaceholder(value = "") {
+  return /[\[({]?\s*y\s*[\/\\]\s*n\s*[\])}]?/i.test(String(value || ""));
+}
+
+function applyReaderNameToText(value = "", language = "zh") {
+  const name = language === "en" ? readerNameEn() : readerNameZh();
   if (!name) return String(value || "");
   return String(value || "").replace(/[\[({]?\s*y\s*[\/\\]\s*n\s*[\])}]?/gi, name);
 }
 
-function applyReaderNameToHtml(html = "") {
-  const name = readerName();
+function applyReaderNameToHtml(html = "", language = "zh") {
+  const name = language === "en" ? readerNameEn() : readerNameZh();
   if (!name || !html) return html || "";
   const doc = new DOMParser().parseFromString(String(html), "text/html");
   const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
   const nodes = [];
   while (walker.nextNode()) nodes.push(walker.currentNode);
   nodes.forEach((node) => {
-    node.nodeValue = applyReaderNameToText(node.nodeValue);
+    node.nodeValue = applyReaderNameToText(node.nodeValue, language);
   });
   return doc.body.innerHTML;
 }
 
+function applyReaderNameToTranslationHtml(html = "", segment = null) {
+  let output = applyReaderNameToHtml(html, "zh");
+  const name = readerNameZh();
+  if (!name || !hasReaderNamePlaceholder(segment?.originalText || segment?.originalHtml || "")) return output;
+  const englishName = readerNameEn().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  output = transformHtmlTextNodes(output, (text) => {
+    let value = String(text || "")
+      .replace(/[\[({]?\s*y\s*[\/\\]\s*n\s*[\])}]?/gi, name)
+      .replace(/[（(\[【]?\s*是\s*[\/／\\]\s*否\s*[）)\]】]?/g, name)
+      .replace(/[（(\[【]?\s*(?:你的名字|您的名字|你名字|读者姓名)\s*[）)\]】]?/g, name);
+    if (englishName) value = value.replace(new RegExp(englishName, "gi"), name);
+    return value;
+  });
+  return output;
+}
+
 function saveReaderName() {
-  const name = readerName();
-  if (name) localStorage.setItem(READER_NAME_STORAGE_KEY, name);
+  const zh = readerNameZh();
+  const en = readerNameEn();
+  if (zh) localStorage.setItem(READER_NAME_STORAGE_KEY, zh);
   else localStorage.removeItem(READER_NAME_STORAGE_KEY);
+  if (en) localStorage.setItem(READER_NAME_EN_STORAGE_KEY, en);
+  else localStorage.removeItem(READER_NAME_EN_STORAGE_KEY);
 }
 
 function loadReaderName() {
-  if (!els.readerNameInput) return;
-  els.readerNameInput.value = localStorage.getItem(READER_NAME_STORAGE_KEY) || "";
+  if (els.readerNameInput) els.readerNameInput.value = localStorage.getItem(READER_NAME_STORAGE_KEY) || "\u62c9\u5c3c\u5a05";
+  if (els.readerNameEnInput) els.readerNameEnInput.value = localStorage.getItem(READER_NAME_EN_STORAGE_KEY) || "Laniya";
 }
 
 function saveGlossary() {
@@ -1609,59 +1363,101 @@ function applyGlossaryToString(value = "") {
     const target = cleanGlossaryTarget(item.target);
     if (!item.source || !target) continue;
     const source = item.source.replace(/[.*+?^\${}()|[\]\\]/g, "\\$&");
-    output = output.replace(new RegExp(source, "g"), target);
+    const pattern = /^[A-Za-z0-9 .'-]+$/.test(item.source) ? `\\b${source}\\b` : source;
+    output = output.replace(new RegExp(pattern, "g"), target);
   }
-  return output;
+  return tidyCjkSpacing(output);
 }
 
 function trustedNameGlossaryTerms() {
   const required = new Map(requiredGlossaryTerms.map(([source, target]) => [source.toLowerCase(), { source, target }]));
   const properNamePattern = /^[A-Z][A-Za-z.'-]*(?:\s+[A-Z][A-Za-z.'-]*)*$/;
+  const ordinaryWordBlocklist = new Set([
+    "you", "reader", "sister", "captain", "sergeant", "agent", "partner", "mission",
+    "alpha", "beta", "omega", "heat", "rut", "plot", "praise", "comfort",
+    "blood", "injury", "violence", "english", "words", "chapters", "comments",
+    "kudos", "bookmarks", "hits", "complete work", "work in progress"
+  ]);
   for (const item of parseGlossary()) {
     const target = cleanGlossaryTarget(item.target);
     if (!item.source || !target) continue;
-    if (required.has(item.source.toLowerCase()) || properNamePattern.test(item.source)) {
+    const sourceKey = item.source.toLowerCase();
+    if (ordinaryWordBlocklist.has(sourceKey)) continue;
+    const looksLikeName = properNamePattern.test(item.source) && (item.source.includes(" ") || item.source.includes(".") || target.length <= 8);
+    if (required.has(sourceKey) || looksLikeName) {
       required.set(item.source.toLowerCase(), { source: item.source, target });
     }
   }
   return [...required.values()].sort((a, b) => b.source.length - a.source.length);
 }
 
+function transformHtmlTextNodes(html = "", transform) {
+  const doc = new DOMParser().parseFromString(String(html || ""), "text/html");
+  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  for (const node of nodes) node.nodeValue = transform(node.nodeValue || "");
+  return doc.body.innerHTML;
+}
+
 function applyTrustedNameGlossary(html = "") {
-  let output = String(html || "");
-  for (const item of trustedNameGlossaryTerms()) {
-    const source = item.source.replace(/[.*+?^\${}()|[\]\\]/g, "\\$&");
-    output = output.replace(new RegExp(`\\b${source}\\b`, "g"), item.target);
-  }
-  return normalizeReadableTerms(output);
+  return transformHtmlTextNodes(html, (text) => {
+    let output = String(text || "");
+    for (const item of trustedNameGlossaryTerms()) {
+      const source = item.source.replace(/[.*+?^\${}()|[\]\\]/g, "\\$&");
+      output = output.replace(new RegExp(`\\b${source}\\b`, "g"), item.target);
+    }
+    return normalizeReadableTerms(output);
+  });
+}
+
+function applyUserGlossaryHtml(html = "") {
+  return transformHtmlTextNodes(html, (text) => applyGlossaryToString(text));
 }
 
 function cleanNameArtifacts(html = "") {
   return normalizeReadableTerms(html);
 }
 
+function tidyCjkSpacingLegacy(value = "") {
+  return tidyCjkSpacing(value);
+}
+
+function tidyCjkSpacing(value = "") {
+  return String(value)
+    .replace(/([\u4e00-\u9fff])\s+([\u4e00-\u9fff])/g, "$1$2")
+    .replace(/\s+([，。！？；：、）》】”])/g, "$1")
+    .replace(/([（《【“])\s+/g, "$1")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
 function normalizeReadableTerms(html = "") {
-  return String(html)
+  return tidyCjkSpacing(String(html)
+    .replace(/\u6b27\u7c73\u4f3d/g, "omega")
+    .replace(/\u963f\u5c14\u6cd5/g, "alpha")
+    .replace(/\u8d1d\u5854/g, "beta")
     .replace(/\u83b1\u6602/g, "\u91cc\u6602")
     .replace(/\u5229\u6602/g, "\u91cc\u6602")
     .replace(/\u674e\u6602/g, "\u91cc\u6602")
-    .replace(/Leon/g, "\u91cc\u6602")
-    .replace(/Rebecca/g, "\u745e\u8d1d\u5361")
+    .replace(/\bLeon\b/g, "\u91cc\u6602")
+    .replace(/\bRebecca\b/g, "\u745e\u8d1d\u5361")
     .replace(/\u4e3d\u8d1d\u5361/g, "\u745e\u8d1d\u5361")
     .replace(/\u745e\u4e3d\u8d1d\u5361/g, "\u745e\u8d1d\u5361")
-    .replace(/Wesker/g, "\u5a01\u65af\u514b")
-    .replace(/Ada/g, "\u827e\u8fbe")
-    .replace(/Claire/g, "\u514b\u83b1\u5c14")
-    .replace(/Chris/g, "\u514b\u91cc\u65af")
-    .replace(/\u91cc\u6602\s*\u91cc\u6602+/g, "\u91cc\u6602")
-    .replace(/\u745e\u8d1d\u5361\s*\u745e\u8d1d\u5361+/g, "\u745e\u8d1d\u5361")
-    .replace(/\u5a01\u65af\u514b\s*\u5a01\u65af\u514b+/g, "\u5a01\u65af\u514b")
-    .replace(/\u827e\u8fbe\s*\u827e\u8fbe+/g, "\u827e\u8fbe")
-    .replace(/\u514b\u83b1\u5c14\s*\u514b\u83b1\u5c14+/g, "\u514b\u83b1\u5c14")
-    .replace(/\u514b\u91cc\u65af\s*\u514b\u91cc\u65af+/g, "\u514b\u91cc\u65af")
+    .replace(/\bWesker\b/g, "\u5a01\u65af\u514b")
+    .replace(/\bAda\b/g, "\u827e\u8fbe")
+    .replace(/\bClaire\b/g, "\u514b\u83b1\u5c14")
+    .replace(/\bChris\b/g, "\u514b\u91cc\u65af")
+    .replace(/(\u91cc\u6602)(?:[\s\uff0c\u3001,]+\1)+/g, "\u91cc\u6602")
+    .replace(/(\u745e\u8d1d\u5361)(?:[\s\uff0c\u3001,]+\1)+/g, "\u745e\u8d1d\u5361")
+    .replace(/(\u5a01\u65af\u514b)(?:[\s\uff0c\u3001,]+\1)+/g, "\u5a01\u65af\u514b")
+    .replace(/(\u827e\u8fbe)(?:[\s\uff0c\u3001,]+\1)+/g, "\u827e\u8fbe")
+    .replace(/(\u514b\u83b1\u5c14)(?:[\s\uff0c\u3001,]+\1)+/g, "\u514b\u83b1\u5c14")
+    .replace(/(\u514b\u91cc\u65af)(?:[\s\uff0c\u3001,]+\1)+/g, "\u514b\u91cc\u65af")
+    .replace(/\u4f60[\s\uff0c\u3001,]*(\u91cc\u6602|\u83b1\u6602|\u745e\u8d1d\u5361)(?=[\uff0c\u3002\uff01\uff1f\u3001\s<]|$)/g, "\u4f60")
     .replace(/\u4f60\s*(\u91cc\u6602|\u83b1\u6602|\u745e\u8d1d\u5361)(?=[\uff0c\u3002\uff01\uff1f\u3001\s<])/g, "\u4f60")
     .replace(/(\u4ed6|\u5979)\s*(\u91cc\u6602|\u83b1\u6602|\u745e\u8d1d\u5361|\u5a01\u65af\u514b|\u827e\u8fbe|\u514b\u83b1\u5c14|\u514b\u91cc\u65af)(?=[\uff0c\u3002\uff01\uff1f\u3001\s<])/g, "$1")
-    .replace(/\u4e27\u5c38\s*\u4e27\u5c38+/g, "\u4e27\u5c38");
+    .replace(/\u4e27\u5c38\s*\u4e27\u5c38+/g, "\u4e27\u5c38"));
 }
 
 function normalizedForCompare(value = "") {
@@ -1687,6 +1483,8 @@ function isEffectivelyUntranslated(segment, html = "") {
   const local = localMetaTranslation(segment) || localShortTextTranslation(segment);
   const translatedText = textOnly(html);
   if (!translatedText) return true;
+  if (/当前等级[：:]\s*[“"]?n[”"]?/i.test(translatedText)
+      && !/^current level\s*:/i.test(String(segment.originalText || "").trim())) return true;
   if (local && textOnly(local) === translatedText) return false;
   const originalText = String(segment.originalText || "").replace(/\s+/g, " ").trim();
   if (normalizedForCompare(translatedText) === normalizedForCompare(originalText)) return true;
@@ -1700,9 +1498,11 @@ function isEffectivelyUntranslated(segment, html = "") {
 function repairSegmentTranslation(segment, html = segment?.translationHtml || "") {
   if (!segment) return html || "";
   if (isDecorativeSegment(segment)) return segment.originalHtml || html || "";
-  const current = applyReaderNameToHtml(applyTrustedNameGlossary(html || ""));
+  const current = applyReaderNameToTranslationHtml(applyUserGlossaryHtml(applyTrustedNameGlossary(html || "")), segment);
   const currentText = textOnly(current);
   const local = localMetaTranslation(segment) || localShortTextTranslation(segment);
+  if (segment.kind === "meta" && looksLikeLeakedAo3Href(currentText)) return local || applyTrustedNameGlossary(segment.originalHtml || "");
+  if (readerName() && isReaderNamePlaceholder(segment.originalText) && local) return local;
   const broken = /\ufffd|\u951f|\u95c1|\u7ef1|\u6d5c/.test(currentText);
   if ((broken || !currentText) && local) return local;
   if (isEffectivelyUntranslated(segment, current)) return local || "";
@@ -1723,23 +1523,65 @@ function parseHtml(options = {}) {
     || textOnly(doc.querySelector("[rel='author']")?.innerHTML);
 
   const nodes = translatableNodes(doc);
+  const chapterInfos = new Map();
+  const chapterInfoForNode = (node) => {
+    const marker = ao3FlowChapterMarkerForNode(node);
+    if (marker) {
+      if (!chapterInfos.has(marker)) {
+        const order = chapterInfos.size + 1;
+        chapterInfos.set(marker, {
+          key: marker.id || "ao3-chapter-" + order,
+          title: chapterTitleFromAo3Marker(marker),
+          order
+        });
+      }
+      return chapterInfos.get(marker);
+    }
+    const chapter = chapterContainerForNode(node);
+    if (!chapter) return { key: "", title: "", order: 0 };
+    if (!chapterInfos.has(chapter)) {
+      const order = chapterInfos.size + 1;
+      chapterInfos.set(chapter, {
+        key: chapter.id || "ao3-chapter-" + order,
+        title: chapterTitleFromContainer(chapter),
+        order
+      });
+    }
+    return chapterInfos.get(chapter);
+  };
 
   state.metadata = { title, author };
   els.exportTitleInput.value = neatTitle(title);
   const keyCounters = new Map();
-  state.segments = nodes.map((node, index) => ({
-    id: `seg-${index + 1}`,
-    index,
-    key: segmentKeyForNode(node, keyCounters),
-    tag: node.tagName.toLowerCase(),
-    kind: segmentKind(node),
-    scope: segmentScope(node),
-    originalHtml: node.outerHTML,
-    originalText: normalizedSegmentText(node),
-    decorative: isDecorativeText(normalizedSegmentText(node)),
-    translationHtml: "",
-    failedReason: ""
-  }));
+  state.segments = nodes.map((node, index) => {
+    const chapterInfo = chapterInfoForNode(node);
+    return {
+      id: `seg-${index + 1}`,
+      index,
+      key: segmentKeyForNode(node, keyCounters),
+      tag: node.tagName.toLowerCase(),
+      kind: segmentKind(node),
+      scope: segmentScope(node),
+      chapterKey: chapterInfo.key,
+      chapterTitle: chapterInfo.title,
+      chapterOrder: chapterInfo.order,
+      originalHtml: segmentOriginalHtml(node),
+      originalText: normalizedSegmentText(node),
+      decorative: isDecorativeText(normalizedSegmentText(node)),
+      translationHtml: "",
+      failedReason: ""
+    };
+  });
+  for (const segment of state.segments) {
+    const local = localMetaTranslation(segment) || localShortTextTranslation(segment);
+    if (local) segment.translationHtml = local;
+  }
+  const booxHeadingCount = hydrateChapterMetadataFromBooxHeadings(doc);
+  const detectedChapterCount = new Set(state.segments.map((segment) => segment.chapterKey).filter(Boolean)).size;
+  const flowChapterCount = ao3FlowChapterBlockCount(doc);
+  if (booxHeadingCount <= 1 && (flowChapterCount > detectedChapterCount || detectedChapterCount <= 1)) {
+    hydrateChapterMetadataByAo3FlowOrder(doc);
+  }
 
   state.previewVisibleCount = PREVIEW_LIMIT;
   state.previewMissingOnly = false;
@@ -1790,12 +1632,12 @@ function renderWorkList() {
     const percent = total ? Math.round((done / total) * 100) : 0;
     const title = work.metadata?.title || work.fileName;
     return `<div class="work-item ${index === state.currentWorkIndex ? "active" : ""}">
-      <button type="button" class="work-open" data-work-index="${index}" title="打开这篇">
+      <button type="button" class="work-open" data-work-index="${index}" title="鎵撳紑杩欑瘒">
         <span>${escapeHtml(title)}</span>
-        <small>${done}/${total} · ${percent}%</small>
+        <small>${done}/${total} 路 ${percent}%</small>
         <i><b style="width:${percent}%"></b></i>
       </button>
-      <button type="button" class="work-delete" data-delete-work="${index}" title="从列表删除这篇">删除</button>
+      <button type="button" class="work-delete" data-delete-work="${index}" title="浠庡垪琛ㄥ垹闄よ繖绡?>鍒犻櫎</button>
     </div>`;
   }).join("");
 }
@@ -1804,6 +1646,13 @@ function updateReady() {
   const ready = state.segments.length > 0;
   const done = countTranslated();
   els.startButton.disabled = !ready;
+  if (els.stopButton) els.stopButton.disabled = !document.body.classList.contains("busy");
+  if (els.startAllButton) {
+    els.startAllButton.disabled = !state.works.some((work) => (work.segments || []).some((segment) => !isTranslatedSegment(segment)));
+  }
+  if (els.doubaoMissingButton) {
+    els.doubaoMissingButton.disabled = !ready || !state.segments.some((segment) => !isTranslatedSegment(segment));
+  }
   els.polishButton.disabled = !ready || !done;
   if (els.clearTranslationsButton) els.clearTranslationsButton.disabled = !ready || !done;
   if (els.doubaoPolishButton) {
@@ -1815,7 +1664,7 @@ function updateReady() {
   if (els.titleSuggestButton) els.titleSuggestButton.disabled = !ready;
   if (els.togglePreviewButton) {
     els.togglePreviewButton.disabled = !ready || state.segments.length <= PREVIEW_LIMIT;
-    els.togglePreviewButton.textContent = state.previewAll ? "\u6536\u8d77\u9884\u89c8" : "\u663e\u793a\u5168\u6587\u9884\u89c8";
+    els.togglePreviewButton.textContent = "\u7ee7\u7eed\u663e\u793a\u66f4\u591a";
   }
   els.applyGlossaryButton.disabled = !ready;
   els.exportButtons.forEach((button) => button.disabled = !ready);
@@ -1847,34 +1696,66 @@ function renderPreview() {
   }
   const missingSegments = state.segments.filter((segment) => !isTranslatedSegment(segment));
   const sourceSegments = state.previewMissingOnly ? missingSegments : state.segments;
-  const visibleCount = state.previewAll
-    ? Math.min(state.previewVisibleCount || PREVIEW_LIMIT, sourceSegments.length)
-    : Math.min(PREVIEW_LIMIT, sourceSegments.length);
+  const visibleCount = Math.min(state.previewVisibleCount || PREVIEW_LIMIT, sourceSegments.length);
   const visible = sourceSegments.slice(0, visibleCount);
-  const hasMorePreview = state.previewAll && visibleCount < sourceSegments.length;
+  const hasMorePreview = visibleCount < sourceSegments.length;
   const notice = state.segments.length > PREVIEW_LIMIT
-    ? '<p class="preview-note">' + (state.previewMissingOnly ? '\u6b63\u5728\u53ea\u663e\u793a\u672a\u7ffb\u8bd1 / \u5931\u8d25\u6bb5\u843d\uff1a' + missingSegments.length + ' \u6bb5\u3002' : (state.previewAll ? '\u5df2\u663e\u793a ' + visibleCount + ' / ' + state.segments.length + ' \u6bb5\uff0c\u53ef\u7ee7\u7eed\u5c55\u5f00\u3002' : '\u5f53\u524d\u53ea\u663e\u793a\u524d ' + PREVIEW_LIMIT + ' \u6bb5\u3002')) + '\u7ffb\u8bd1\u548c\u5bfc\u51fa\u90fd\u4f1a\u5904\u7406\u5168\u6587\u3002</p>'
+    ? '<p class="preview-note">' + (state.previewMissingOnly ? '\u6b63\u5728\u53ea\u663e\u793a\u672a\u7ffb\u8bd1 / \u5931\u8d25\u6bb5\u843d\uff1a' + missingSegments.length + ' \u6bb5\u3002' : '\u5df2\u663e\u793a ' + visibleCount + ' / ' + state.segments.length + ' \u6bb5\uff0c\u4e0b\u7ffb\u4f1a\u81ea\u52a8\u7ee7\u7eed\u6e32\u67d3\u3002') + '\u7ffb\u8bd1\u548c\u5bfc\u51fa\u90fd\u4f1a\u5904\u7406\u5168\u6587\u3002</p>'
     : '';
   const missingButton = missingSegments.length
-    ? '<button type="button" class="preview-more" data-preview-missing>' + (state.previewMissingOnly ? '\u8fd4\u56de\u666e\u901a\u9884\u89c8' : '\u53ea\u770b ' + missingSegments.length + ' \u6bb5\u672a\u7ffb\u8bd1 / \u5931\u8d25') + '</button>'
+    ? '<button type="button" class="preview-more" data-preview-missing>' + (state.previewMissingOnly ? '\u8fd4\u56de\u666e\u901a\u9884\u89c8' : '\u53ea\u770b ' + missingSegments.length + ' \u6bb5\u5f85\u8865\u7ffb') + '</button>'
     : '';
   const moreButton = hasMorePreview
-    ? '<button type="button" class="preview-more" data-preview-more>\u7ee7\u7eed\u663e\u793a\u66f4\u591a\u6bb5\u843d</button>'
+    ? '<button type="button" class="preview-more" data-preview-more>\u7ee7\u7eed\u663e\u793a\u66f4\u591a</button>'
     : '';
   els.preview.innerHTML = notice + missingButton + visible.map((segment) => {
-    const failed = segment.failedReason ? ' failed' : '';
-    const zh = isDecorativeSegment(segment)
-      ? ""
-      : (segment.translationHtml || '<' + segment.tag + '><span class="empty">' + (segment.failedReason ? '\u672a\u7ffb\u8bd1\uff0c\u70b9 Start translate \u4f1a\u53ea\u8865\u8fd9\u6bb5\u3002' : 'Not translated yet.') + '</span></' + segment.tag + '>');
+    const missing = !isDecorativeSegment(segment) && !isTranslatedSegment(segment);
+    const failed = segment.failedReason && state.previewMissingOnly ? ' failed' : '';
+    const zh = isTranslatedSegment(segment) ? segment.translationHtml : "";
     const selector = segment.kind === "body"
       ? '<label class="segment-tools" title="\u9009\u4e2d\u540e\u53ef\u91cd\u65b0\u7ffb\u8bd1"><input type="checkbox" class="segment-select" aria-label="\u9009\u4e2d\u8fd9\u6bb5\u91cd\u65b0\u7ffb\u8bd1" ' + (selectedSegmentIds.has(segment.id) ? 'checked' : '') + '><span></span></label>'
       : '';
-    return '<div class="pair ' + (selectedSegmentIds.has(segment.id) ? 'selected ' : '') + failed + '" data-id="' + segment.id + '">' +
+    const retryTools = !isDecorativeSegment(segment) && !isTranslatedSegment(segment)
+      ? '<div class="retry-tools"><button type="button" data-retry-segment="current">\u8865\u8fd9\u6bb5</button><button type="button" data-retry-segment="doubao">\u8c46\u5305\u8865</button></div>'
+      : '';
+    return '<div class="pair ' + (selectedSegmentIds.has(segment.id) ? 'selected ' : '') + (missing ? 'missing ' : '') + failed + '" data-id="' + segment.id + '">' +
       selector +
-      '<div class="en">' + applyReaderNameToHtml(segment.originalHtml) + '</div>' +
-      '<div class="zh" contenteditable="true" spellcheck="false">' + applyReaderNameToHtml(zh) + '</div>' +
+      '<div class="en">' + applyReaderNameToHtml(segment.originalHtml, "en") + '</div>' +
+      retryTools +
+      '<div class="zh" contenteditable="true" spellcheck="false">' + applyReaderNameToTranslationHtml(zh, segment) + '</div>' +
       '</div>';
   }).join("") + moreButton;
+}
+
+function updateVisibleTranslation(segment) {
+  if (!segment || !els.preview) return;
+  const selectorId = String(segment.id || "").replace(/["\\]/g, "\\$&");
+  const pair = els.preview.querySelector('[data-id="' + selectorId + '"]');
+  if (!pair) return;
+  const translated = isTranslatedSegment(segment);
+  const zh = pair.querySelector(".zh");
+  if (zh && !zh.contains(document.activeElement)) {
+    zh.innerHTML = translated ? applyReaderNameToTranslationHtml(segment.translationHtml, segment) : "";
+  }
+  pair.classList.toggle("missing", !isDecorativeSegment(segment) && !translated);
+  if (translated) pair.querySelector(".retry-tools")?.remove();
+}
+
+function extendPreviewPage() {
+  if (!state.segments.length) return;
+  const sourceCount = state.previewMissingOnly
+    ? state.segments.filter((segment) => !isTranslatedSegment(segment)).length
+    : state.segments.length;
+  const current = state.previewVisibleCount || PREVIEW_LIMIT;
+  if (current >= sourceCount) return;
+  state.previewVisibleCount = Math.min(sourceCount, current + PREVIEW_PAGE_SIZE);
+  schedulePreviewRender(true);
+}
+
+function maybeExtendPreviewOnScroll() {
+  if (!state.segments.length) return;
+  const bottomGap = document.documentElement.scrollHeight - (window.scrollY + window.innerHeight);
+  if (bottomGap < 900) extendPreviewPage();
 }
 
 function chunkSegments(size, list = state.segments) {
@@ -1912,17 +1793,26 @@ function segmentContext(segment) {
   for (let i = index - 1; i >= 0 && before.length < 2; i -= 1) {
     if (state.segments[i].kind === "body") before.unshift(state.segments[i].originalText);
   }
-  for (let i = index + 1; i < state.segments.length && after.length < 1; i += 1) {
+  for (let i = index + 1; i < state.segments.length && after.length < 2; i += 1) {
     if (state.segments[i].kind === "body") after.push(state.segments[i].originalText);
   }
   return {
-    before: before.join("\n").slice(-600),
-    after: after.join("\n").slice(0, 300)
+    before: before.join("\n").slice(-700),
+    after: after.join("\n").slice(0, 500)
   };
 }
 
-async function translateAll() {
-  const provider = els.providerSelect.value;
+async function translateAll(options = {}) {
+  if (!options.keepStopState) translationStopRequested = false;
+  let provider = options.provider || els.providerSelect.value;
+  if (provider !== "google") {
+    provider = "google";
+    els.providerSelect.value = "google";
+    updateAiSettings();
+    setStatus("Full translation uses Google for speed.");
+  }
+  const work = activeWork();
+  const workTitle = work?.metadata?.title || work?.fileName || state.metadata?.title || "current work";
   if (provider === "doubao" && !els.apiKeyInput.value.trim() && !hasServerDoubaoKey) {
     setStatus("Paste Doubao API Key first, or set local ARK_API_KEY.", true);
     revealKeySettings("doubao");
@@ -1943,24 +1833,31 @@ async function translateAll() {
     syncActiveWork();
     updateReady();
     state.previewMissingOnly = false;
-    schedulePreviewRender(true);
+    if (!bulkTranslateMode) schedulePreviewRender(true);
     setStatus("No missing paragraphs. Preview and export are ready.");
-    return;
+    return 0;
   }
 
+  if (!bulkTranslateMode) state.previewMissingOnly = false;
+
   const googleContext = provider === "google" && (!els.googleContextMode || els.googleContextMode.checked);
-  const limits = provider === "google"
+  const limits = options.limits || (provider === "google"
     ? (googleContext
       ? { maxItems: GOOGLE_CONTEXT_MAX_ITEMS, maxChars: GOOGLE_CONTEXT_MAX_CHARS }
       : { maxItems: GOOGLE_NORMAL_MAX_ITEMS, maxChars: GOOGLE_NORMAL_MAX_CHARS })
-    : (AI_CHUNK_LIMITS[provider] || AI_CHUNK_LIMITS.deepseek);
+    : (AI_CHUNK_LIMITS[provider] || AI_CHUNK_LIMITS.deepseek));
   const chunks = chunkSegmentsByLoad(targetSegments, limits.maxItems, limits.maxChars);
 
   els.startButton.disabled = true;
   setBusy(true);
   let completed = state.segments.filter(isTranslatedSegment).length;
   let failedCount = 0;
-  setProgress(completed, state.segments.length);
+  let renderedChunks = 0;
+  let lastPreviewTick = 0;
+  let lastSaveTick = 0;
+  const reportProgress = (done, total) => options.onProgress ? options.onProgress(done, total) : setProgress(done, total);
+  reportProgress(completed, state.segments.length);
+  setStatus("Translating current work: " + workTitle);
 
   const applyTranslations = (translations, chunk) => {
     const expectedIds = new Set(chunk.map((segment) => segment.id));
@@ -1990,10 +1887,23 @@ async function translateAll() {
       if (wasDone && !isDone) completed -= 1;
       if (!isDone) failedCount += 1;
     }
-    setProgress(completed, state.segments.length);
-    syncActiveWork();
-    updateReady();
-    schedulePreviewRender();
+    reportProgress(completed, state.segments.length);
+    renderedChunks += 1;
+    setStatus((provider === "google" ? "Google translate current work " : "Translating current work ")
+      + completed + "/" + state.segments.length + " - batch " + renderedChunks + "/" + chunks.length);
+    const now = Date.now();
+    if (work) {
+      work.progressDone = completed;
+      work.progressTotal = state.segments.length;
+    }
+    for (const item of translations || []) updateVisibleTranslation(state.segmentById.get(item.id));
+    scheduleWorkListRender();
+    if (els.workMeta) els.workMeta.textContent = state.segments.length + " segments / " + completed + " translated";
+    if (renderedChunks % 24 === 0 || now - lastSaveTick > 15000) {
+      lastSaveTick = now;
+      syncActiveWork();
+    }
+    lastPreviewTick = now;
   };
 
   try {
@@ -2001,8 +1911,8 @@ async function translateAll() {
       let nextIndex = 0;
       let googleHadSplitError = false;
       const translateChunk = async (index) => {
+        if (translationStopRequested) return;
         const chunk = chunks[index];
-        setStatus("Google translate " + completed + "/" + state.segments.length + " ? batch " + (index + 1) + "/" + chunks.length);
         const translations = await postTranslateWithSplit({
           provider,
           endpoint: els.endpointInput.value.trim(),
@@ -2024,22 +1934,22 @@ async function translateAll() {
         applyTranslations(translations, chunk);
       };
       async function worker() {
-        while (nextIndex < chunks.length && !googleHadSplitError) {
+        while (nextIndex < chunks.length && !googleHadSplitError && !translationStopRequested) {
           const index = nextIndex;
           nextIndex += 1;
           await translateChunk(index);
         }
       }
       await Promise.all(Array.from({ length: Math.min(GOOGLE_FAST_CONCURRENCY, chunks.length) }, () => worker()));
-      while (nextIndex < chunks.length) {
+      while (nextIndex < chunks.length && !translationStopRequested) {
         const index = nextIndex;
         nextIndex += 1;
         await translateChunk(index);
       }
     } else {
-      for (let index = 0; index < chunks.length; index += 1) {
+      for (let index = 0; index < chunks.length && !translationStopRequested; index += 1) {
         const chunk = chunks[index];
-        setStatus("Translating batch " + (index + 1) + "/" + chunks.length + "...");
+        setStatus("Translating current work batch " + (index + 1) + "/" + chunks.length + "...");
         const translations = await postTranslateWithSplit({
           provider,
           endpoint: els.endpointInput.value.trim(),
@@ -2061,34 +1971,175 @@ async function translateAll() {
       }
     }
   } finally {
-    els.startButton.disabled = false;
-    setBusy(false);
-    schedulePreviewRender(true);
+    syncActiveWork();
+    updateReady();
+    if (!bulkTranslateMode) {
+      els.startButton.disabled = false;
+      setBusy(false);
+    }
+    if (!bulkTranslateMode) schedulePreviewRender(true);
   }
 
   const missing = state.segments.filter((segment) => !isTranslatedSegment(segment)).length;
-  state.previewMissingOnly = Boolean(missing);
+  state.previewMissingOnly = false;
   if (missing) {
-    state.previewAll = true;
     state.previewVisibleCount = PREVIEW_LIMIT;
-  } else {
-    state.previewMissingOnly = false;
   }
-  schedulePreviewRender(true);
+  if (!bulkTranslateMode) schedulePreviewRender(true);
+  updateReady();
   setStatus(missing
-    ? "Done with " + missing + " failed / untranslated. Click Start translate to retry only missing paragraphs."
+    ? (translationStopRequested ? "Stopped. Saved completed paragraphs; you can switch works now." : "Done. " + missing + " paragraphs still need retry. Click Start translate to retry only those.")
     : "Done. Preview and export are ready.");
+  return missing;
+}
+
+async function translateAllWorks() {
+  const targets = state.works
+    .map((work, index) => ({ work, index }))
+    .filter(({ work }) => (work.segments || []).some((segment) => !isTranslatedSegment(segment)));
+  if (!targets.length) return setStatus("No missing paragraphs in loaded works.");
+  const originalIndex = state.currentWorkIndex;
+  bulkTranslateMode = true;
+  translationStopRequested = false;
+  if (els.startAllButton) els.startAllButton.disabled = true;
+  els.startButton.disabled = true;
+  let doneWorks = 0;
+  let failedWorks = 0;
+  const totalSegments = targets.reduce((sum, { work }) => sum + (work.segments?.length || 0), 0);
+  let overallDone = targets.reduce((sum, { work }) => sum + countWorkTranslated(work), 0);
+  setProgress(overallDone, totalSegments);
+  try {
+    for (const { work, index } of targets) {
+      setActiveWork(index);
+      const workStartDone = countWorkTranslated(work);
+      setProgress(overallDone, totalSegments);
+      setStatus("Batch translating " + (doneWorks + 1) + "/" + targets.length + ": " + (work.metadata?.title || work.fileName || "work"));
+      try {
+        await translateAll({
+          keepStopState: true,
+          onProgress: (workDone) => setProgress(overallDone + Math.max(0, workDone - workStartDone), totalSegments)
+        });
+        overallDone += Math.max(0, countWorkTranslated(work) - workStartDone);
+        setProgress(overallDone, totalSegments);
+        doneWorks += 1;
+        setStatus("Finished " + doneWorks + "/" + targets.length + ". Moving to next work...");
+        if (translationStopRequested) break;
+      } catch (error) {
+        failedWorks += 1;
+        setStatus("Skipped one failed work and continuing: " + (error.message || "translation failed"), true);
+      }
+    }
+  } finally {
+    bulkTranslateMode = false;
+    setBusy(false);
+    if (state.works[originalIndex]) setActiveWork(originalIndex);
+    else if (state.works.length) setActiveWork(0);
+    updateReady();
+    schedulePreviewRender(true);
+  }
+  setStatus("Batch translate finished: " + doneWorks + "/" + targets.length + " works" + (failedWorks ? ", " + failedWorks + " failed/skipped." : "."));
+}
+
+async function translateMissingWithDoubao() {
+  if (!els.apiKeyInput.value.trim() && !hasServerDoubaoKey) {
+    setStatus("Doubao key is not connected. Start translate is still using your current translator.", true);
+    return;
+  }
+  await translateAll({ provider: "doubao", limits: AI_CHUNK_LIMITS.doubaoFallback });
+}
+
+async function translateOneSegment(segmentId, requestedProvider = "current") {
+  const segment = state.segmentById.get(segmentId);
+  if (!segment || isDecorativeSegment(segment)) return;
+  const provider = requestedProvider === "doubao" ? "doubao" : els.providerSelect.value;
+  if (provider === "doubao" && !els.apiKeyInput.value.trim() && !hasServerDoubaoKey) {
+    setStatus("Doubao key is not connected. Use the main Translator dropdown only when you want to configure Doubao.", true);
+    return;
+  }
+  if (provider === "deepseek" && !els.apiKeyInput.value.trim() && !hasServerDeepSeekKey) {
+    setStatus("Fill DeepSeek API Key once first.", true);
+    revealKeySettings("deepseek");
+    return;
+  }
+  const local = localMetaTranslation(segment) || localShortTextTranslation(segment);
+  if (local) {
+    segment.translationHtml = local;
+    segment.failedReason = "";
+    syncActiveWork();
+    updateReady();
+    schedulePreviewRender(true);
+    setStatus("This paragraph was filled by local rules.");
+    return;
+  }
+  const defaults = providerDefaults[provider] || {};
+  const googleContext = provider === "google" && (!els.googleContextMode || els.googleContextMode.checked);
+  setBusy(true);
+  setStatus((provider === "doubao" ? "Doubao" : provider === "google" ? "Google" : "AI") + " translating this paragraph...");
+  try {
+    const translations = await postTranslateWithSplit({
+      provider,
+      endpoint: defaults.endpoint || els.endpointInput.value.trim(),
+      apiKey: els.apiKeyInput.value.trim(),
+      model: defaults.model || els.modelInput.value.trim(),
+      glossary: parseGlossary(),
+      from: "en",
+      to: "zh-CN",
+      googleMode: googleContext ? "context" : "normal",
+      single: true,
+      items: [{
+        id: segment.id,
+        tag: segment.tag,
+        text: segment.originalText,
+        html: segment.originalHtml,
+        kind: segment.kind,
+        ...segmentContext(segment)
+      }]
+    });
+    const item = translations[0] || {};
+    if (item.error) throw new Error(item.error);
+    const repaired = repairSegmentTranslation(segment, item.html || "");
+    if (!repaired || isEffectivelyUntranslated(segment, repaired)) throw new Error("Still untranslated.");
+    segment.translationHtml = repaired;
+    segment.failedReason = "";
+    syncActiveWork();
+    updateReady();
+    schedulePreviewRender(true);
+    setStatus("Filled this paragraph.");
+  } catch (error) {
+    segment.failedReason = error.message || "untranslated";
+    syncActiveWork();
+    updateReady();
+    schedulePreviewRender(true);
+    setStatus(error.message || "This paragraph did not translate.", true);
+  } finally {
+    setBusy(false);
+  }
 }
 
 async function postTranslate(payload) {
-  const response = await fetch("/api/translate", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload)
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || "Request failed.");
-  return data.translations || [];
+  const controller = new AbortController();
+  const timeoutMs = payload.provider === "doubao" ? (payload.single ? 35000 : 70000) : 85000;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch("/api/translate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Request failed.");
+    return data.translations || [];
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error(payload.provider === "doubao"
+        ? "Doubao timed out; splitting this batch smaller."
+        : "Translator timed out; splitting this batch smaller.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function postTranslateWithRetry(payload) {
@@ -2097,7 +2148,7 @@ async function postTranslateWithRetry(payload) {
   let lastError;
   for (let attempt = 0; attempt < delays.length; attempt += 1) {
     if (delays[attempt]) {
-      setStatus(`Google 暂时没接住，等一下再试 ${attempt + 1}/${delays.length}...`);
+      setStatus(`Google 鏆傛椂娌℃帴浣忥紝绛変竴涓嬪啀璇?${attempt + 1}/${delays.length}...`);
       await sleep(delays[attempt]);
     }
     try {
@@ -2111,6 +2162,10 @@ async function postTranslateWithRetry(payload) {
 
 async function postTranslateWithSplit(payload) {
   try {
+    const items = payload.items || [];
+    if (payload.provider === "google" && items.length > GOOGLE_FAST_SPLIT_ITEMS) {
+      return await postTranslate(payload);
+    }
     return await postTranslateWithRetry(payload);
   } catch (error) {
     const items = payload.items || [];
@@ -2125,6 +2180,9 @@ async function postTranslateWithSplit(payload) {
       if (typeof payload.onSplit === "function") payload.onSplit();
       setStatus("Google batch was too large; splitting and continuing...");
       await sleep(1200);
+    } else if (payload.provider === "doubao") {
+      setStatus("Doubao is slow; splitting this batch smaller...");
+      await sleep(350);
     }
     const middle = Math.ceil(items.length / 2);
     const left = await postTranslateWithSplit({ ...payload, items: items.slice(0, middle) });
@@ -2171,7 +2229,7 @@ async function polishChinese(provider = "deepseek") {
         }))
       });
     } catch (error) {
-      setStatus(`这一小批润色失败，已跳过继续：${error.message || error}`, true);
+      setStatus(`杩欎竴灏忔壒娑﹁壊澶辫触锛屽凡璺宠繃缁х画锛?{error.message || error}`, true);
       done += chunk.length;
       setProgress(done, translated.length);
       continue;
@@ -2203,7 +2261,7 @@ async function doubaoRewriteSelected() {
     return;
   }
   const selected = state.segments.filter((segment) => selectedSegmentIds.has(segment.id) && segment.kind === "body");
-  if (!selected.length) return setStatus("先在右侧勾选要重翻的段落。", true);
+  if (!selected.length) return setStatus("Select body paragraphs first.", true);
   const chunks = chunkSegmentsByLoad(selected, 4, 5200);
   if (els.doubaoPolishButton) els.doubaoPolishButton.disabled = true;
   setBusy(true);
@@ -2272,8 +2330,8 @@ async function suggestTitles() {
       }]
     });
     const raw = textWithBreaks(translations[0]?.html || "");
-    const ideas = raw.split(/[；;\n|]/)
-      .map((item) => item.replace(/^[0-9一二三四五]\s*[.、:：-]?\s*/, "").trim())
+    const ideas = raw.split(/[锛?\n|]/)
+      .map((item) => item.replace(/^[0-9涓€浜屼笁鍥涗簲]\s*[.銆?锛?]?\s*/, "").trim())
       .filter(Boolean)
       .slice(0, 5);
     els.titleIdeas.innerHTML = ideas.length
@@ -2303,7 +2361,7 @@ async function loadServerConfig() {
 function addTerm() {
   const source = els.termSourceInput.value.trim();
   const target = els.termTargetInput.value.trim();
-  if (!source || !target) return setStatus("原文和译文都要填一下。", true);
+  if (!source || !target) return setStatus("Fill both original and translation.", true);
   const lines = els.glossaryInput.value.split(/\r?\n/);
   const existingIndex = lines.findIndex((line) => {
     const index = line.search(/[:：]/);
@@ -2317,7 +2375,7 @@ function addTerm() {
   els.termSourceInput.value = "";
   els.termTargetInput.value = "";
   syncActiveWork();
-  setStatus(existingIndex >= 0 ? `已更新词条：${source}` : `已加入词条：${source}`);
+  setStatus(existingIndex >= 0 ? `Updated glossary: ${source}` : `Added glossary: ${source}`);
 }
 
 function addPresets() {
@@ -2329,7 +2387,7 @@ function applyGlossaryToPreview() {
   for (const segment of state.segments) {
     const current = segment.translationHtml || "";
     const repaired = repairSegmentTranslation(segment, current);
-    const next = segment.kind === "meta" ? applyGlossaryToString(repaired) : applyTrustedNameGlossary(repaired);
+    const next = segment.kind === "meta" ? applyGlossaryToString(repaired) : applyUserGlossaryHtml(applyTrustedNameGlossary(repaired));
     if (next !== segment.translationHtml) {
       segment.translationHtml = next;
       changed += 1;
@@ -2358,7 +2416,7 @@ function ensureExportStyle(doc, type) {
     ".ao3-bilingual-body{margin-bottom:1.05em;}",
     ".ao3-bilingual-body>.ao3-en,.ao3-bilingual-body>.ao3-zh{display:block;margin:.35em 0;}",
     ".ao3-bilingual-body>.ao3-zh{margin-top:.55em;}",
-    ".ao3-zh em,.ao3-zh i{font-style:normal;font-weight:750;letter-spacing:.08em;}",
+    ".ao3-zh em,.ao3-zh i{font-style:normal;font-weight:750;letter-spacing:.03em;}",
     ".ao3-meta-zh{font-weight:650;}",
     type === "zh" ? ".ao3-en{display:none!important;}" : "",
     type === "en" ? ".ao3-zh{display:none!important;}" : ""
@@ -2377,14 +2435,13 @@ function replaceNodeHtml(node, html) {
 }
 
 function untranslatedExportHtml(segment) {
-  const tag = segment?.tag || "p";
   if (isDecorativeSegment(segment)) return segment.originalHtml || "";
-  return "<" + tag + "><span class=\"ao3-untranslated\">\u3010\u672a\u7ffb\u8bd1\uff1a\u56de\u5230\u7f51\u9875\u8865\u7ffb\u3011</span></" + tag + ">";
+  return "";
 }
 
 function exportTranslationHtml(segment) {
-  if (isDecorativeSegment(segment)) return applyReaderNameToHtml(segment.originalHtml || "");
-  return applyReaderNameToHtml(isTranslatedSegment(segment) ? segment.translationHtml : untranslatedExportHtml(segment));
+  if (isDecorativeSegment(segment)) return applyReaderNameToHtml(segment.originalHtml || "", "en");
+  return applyReaderNameToTranslationHtml(isTranslatedSegment(segment) ? segment.translationHtml : untranslatedExportHtml(segment), segment);
 }
 
 function innerHtmlForExport(html = "") {
@@ -2420,6 +2477,7 @@ function booxExportStyle(type) {
     ".chapter{break-before:page;page-break-before:always;}",
     ".chapter:first-of-type{break-before:auto;page-break-before:auto;}",
     ".chapter-title{text-align:center;margin:2em 0 1.5em;}",
+    ".chapter-subtitle{text-align:center;margin:-1em 0 1.5em;font-weight:normal;}",
     ".segpair{margin:0 0 1.2em;}",
     ".src{margin:0 0 .35em;}",
     ".zh{margin:0;}",
@@ -2430,29 +2488,47 @@ function booxExportStyle(type) {
 }
 
 function buildBooxChapters(segments, exportTitle) {
-  const bodySegments = segments.filter((segment) => (
-    segment.kind !== "meta"
-    && !["summary", "notes"].includes(segment.scope)
-    && (!["title", "chapter-title"].includes(segment.scope) || isChapterTitleSegment(segment, exportTitle))
-  ));
-  const explicitTitles = bodySegments.filter((segment) => isChapterTitleSegment(segment, exportTitle));
+  const bodySegments = segments.filter((segment) => isBooxBodySegment(segment, exportTitle));
+  const explicitTitles = bodySegments.filter((segment) => isChapterTitleSegment(segment, exportTitle) || isChapterMarkerText(segment));
   const chapters = [];
   let current = null;
+  let currentKey = "";
 
-  const startChapter = (title) => {
+  const startChapter = (title, hasTitle = Boolean(title)) => {
     current = {
       id: "chapter-" + (chapters.length + 1),
       title: title || "",
-      hasTitle: Boolean(title),
+      hasTitle,
       segments: []
     };
     chapters.push(current);
   };
 
+  const ao3ChapterKeys = [...new Set(bodySegments.map((segment) => segment.chapterKey).filter(Boolean))];
+  if (ao3ChapterKeys.length > 1) {
+    for (const segment of bodySegments) {
+      if (!segment.chapterKey) continue;
+      if (segment.chapterKey !== currentKey) {
+        currentKey = segment.chapterKey;
+        const title = cleanExportText(segment.chapterTitle || "");
+        startChapter(title, Boolean(title));
+      }
+      if (isChapterTitleSegment(segment, exportTitle) || isChapterMarkerText(segment)) {
+        if (current && (!current.title || /^Chapter \d+$/i.test(current.title))) {
+          current.title = cleanExportText(segment.originalText);
+          current.hasTitle = Boolean(current.title);
+        }
+        continue;
+      }
+      current.segments.push(segment);
+    }
+    if (chapters.length) return chapters.filter((chapter) => chapter.segments.some((segment) => !isDecorativeSegment(segment)));
+  }
+
   if (!explicitTitles.length) startChapter("");
 
   for (const segment of bodySegments) {
-    if (isChapterTitleSegment(segment, exportTitle)) {
+    if (isChapterTitleSegment(segment, exportTitle) || isChapterMarkerText(segment)) {
       startChapter(cleanExportText(segment.originalText));
       continue;
     }
@@ -2461,24 +2537,209 @@ function buildBooxChapters(segments, exportTitle) {
   }
 
   if (!chapters.length) startChapter("");
-  return chapters;
+  return chapters.filter((chapter) => chapter.segments.some((segment) => !isDecorativeSegment(segment)));
+}
+
+function isChapterMarkerText(segment) {
+  const text = cleanExportText(segment?.originalText || "");
+  return /^chapter\s+\d+(?:\s*[:锛?-].*)?$/i.test(text);
+}
+
+function isBooxBodySegment(segment, exportTitle = "") {
+  return Boolean(segment && (
+    segment.kind !== "meta"
+    && !["summary", "notes"].includes(segment.scope)
+    && (!["title", "chapter-title"].includes(segment.scope) || isChapterTitleSegment(segment, exportTitle) || isChapterMarkerText(segment))
+  ));
+}
+
+function hydrateChapterMetadataFromBooxHeadings(doc) {
+  const root = doc.querySelector("#chapters") || doc.body;
+  if (!root) return 0;
+
+  let headings = [...root.querySelectorAll("h1.heading, h2.heading, h3.heading, h3.title, h2.title")]
+    .filter((heading) => !heading.classList.contains("toc-heading"));
+  if (!headings.length) {
+    headings = [...root.querySelectorAll("p, div")].filter((node) => {
+      if (node.children.length && ![...node.children].every((child) => child.matches("span, strong, b, em, i, a, br"))) return false;
+      const text = cleanExportText(node.textContent);
+      return text.length <= 160 && /^(?:chapter|part)\s+(?:\d+|[ivxlcdm]+)\b/i.test(text);
+    });
+  }
+
+  const entries = [];
+  const seenStarts = new Set();
+  for (const heading of headings) {
+    let start = heading;
+    while (start.parentElement && start.parentElement !== root) start = start.parentElement;
+    if (start.parentElement !== root || seenStarts.has(start)) continue;
+    seenStarts.add(start);
+    entries.push({
+      start,
+      title: cleanExportText(heading.textContent)
+    });
+  }
+  if (entries.length <= 1) return 0;
+
+  const children = [...root.children];
+  const childIndex = new Map(children.map((child, index) => [child, index]));
+  const starts = entries.map((entry) => childIndex.get(entry.start));
+  const nodes = translatableNodes(doc);
+  const lookup = buildSegmentLookup(state.segments);
+  const usedIds = new Set();
+  const counters = new Map();
+  const assignedChapters = new Set();
+
+  state.segments.forEach((segment) => {
+    segment.chapterKey = "";
+    segment.chapterTitle = "";
+    segment.chapterOrder = 0;
+  });
+
+  nodes.forEach((node, nodeIndex) => {
+    let top = node;
+    while (top.parentElement && top.parentElement !== root) top = top.parentElement;
+    const index = childIndex.get(top);
+    if (index === undefined) return;
+    let chapterIndex = -1;
+    for (let i = 0; i < starts.length; i += 1) {
+      if (starts[i] > index) break;
+      chapterIndex = i;
+    }
+    if (chapterIndex < 0) return;
+    const segment = segmentForExportNode(node, nodeIndex, lookup, usedIds, counters);
+    if (!segment) return;
+    usedIds.add(segment.id);
+    segment.chapterKey = "boox-heading-chapter-" + (chapterIndex + 1);
+    segment.chapterTitle = entries[chapterIndex].title;
+    segment.chapterOrder = chapterIndex + 1;
+    if (isBooxBodySegment(segment, state.metadata?.title || "")) assignedChapters.add(chapterIndex);
+  });
+
+  return assignedChapters.size;
+}
+
+function hydrateChapterMetadataFromRawHtml() {
+  if (!state.rawHtml) return;
+  const doc = new DOMParser().parseFromString(state.rawHtml, "text/html");
+  sanitize(doc.documentElement);
+  markAo3ChapterTitles(doc);
+  normalizeAo3BreakParagraphs(doc);
+  if (hydrateChapterMetadataFromBooxHeadings(doc) > 1) return;
+  const nodes = translatableNodes(doc);
+  const lookup = buildSegmentLookup(state.segments);
+  const usedIds = new Set();
+  const counters = new Map();
+  const chapterInfos = new Map();
+  const chapterInfoForNode = (node) => {
+    const marker = ao3FlowChapterMarkerForNode(node);
+    if (marker) {
+      if (!chapterInfos.has(marker)) {
+        const order = chapterInfos.size + 1;
+        chapterInfos.set(marker, {
+          key: marker.id || "ao3-chapter-" + order,
+          title: chapterTitleFromAo3Marker(marker),
+          order
+        });
+      }
+      return chapterInfos.get(marker);
+    }
+    const chapter = chapterContainerForNode(node);
+    if (!chapter) return { key: "", title: "", order: 0 };
+    if (!chapterInfos.has(chapter)) {
+      const order = chapterInfos.size + 1;
+      chapterInfos.set(chapter, {
+        key: chapter.id || "ao3-chapter-" + order,
+        title: chapterTitleFromContainer(chapter),
+        order
+      });
+    }
+    return chapterInfos.get(chapter);
+  };
+  nodes.forEach((node, index) => {
+    const segment = segmentForExportNode(node, index, lookup, usedIds, counters);
+    if (!segment) return;
+    usedIds.add(segment.id);
+    const info = chapterInfoForNode(node);
+    if (!info.key) return;
+    segment.chapterKey = info.key;
+    segment.chapterTitle = info.title;
+    segment.chapterOrder = info.order;
+  });
+  const detectedChapterCount = new Set(state.segments.map((segment) => segment.chapterKey).filter(Boolean)).size;
+  const flowChapterCount = ao3FlowChapterBlockCount(doc);
+  if (flowChapterCount > detectedChapterCount || detectedChapterCount <= 1) {
+    hydrateChapterMetadataByAo3FlowOrder(doc);
+  }
+}
+
+function hydrateChapterMetadataByAo3FlowOrder(doc) {
+  const chapterBlocks = [];
+  const roots = [...doc.querySelectorAll("#chapters")];
+  for (const root of roots) {
+    let current = null;
+    for (const child of root.children) {
+      if (child.matches?.(".meta.group")) {
+        const title = chapterTitleFromAo3Marker(child);
+        if (title) {
+          current = { title, nodes: [] };
+          chapterBlocks.push(current);
+        }
+        continue;
+      }
+      if (current && child.matches?.(".userstuff, blockquote, div, section, article")) {
+        current.nodes.push(...translatableNodes(child));
+      }
+    }
+  }
+  const blocks = chapterBlocks.filter((block) => block.nodes.length);
+  if (blocks.length <= 1) return;
+  const targetSegments = state.segments.filter((segment) => isBooxBodySegment(segment, state.metadata?.title || ""));
+  if (!targetSegments.length) return;
+  targetSegments.forEach((segment) => {
+    segment.chapterKey = "";
+    segment.chapterTitle = "";
+    segment.chapterOrder = 0;
+  });
+  let offset = 0;
+  blocks.forEach((block, blockIndex) => {
+    const key = "ao3-flow-chapter-" + (blockIndex + 1);
+    const isLast = blockIndex === blocks.length - 1;
+    const sliceEnd = isLast ? targetSegments.length : Math.min(targetSegments.length, offset + block.nodes.length);
+    for (const segment of targetSegments.slice(offset, sliceEnd)) {
+      segment.chapterKey = key;
+      segment.chapterTitle = block.title;
+      segment.chapterOrder = blockIndex + 1;
+    }
+    offset = sliceEnd;
+  });
 }
 
 function buildSegPairHtml(segment, type) {
-  const source = innerHtmlForExport(applyReaderNameToHtml(segment.originalHtml));
+  const source = innerHtmlForExport(applyReaderNameToHtml(segment.originalHtml, "en"));
   if (isDecorativeSegment(segment)) {
     return "<section class=\"segpair decorative\" id=\"" + escapeHtml(segment.id) + "\"><p class=\"src\">" + source + "</p></section>";
   }
   const translated = isTranslatedSegment(segment)
-    ? innerHtmlForExport(applyReaderNameToHtml(segment.translationHtml))
-    : "\u3010\u672a\u7ffb\u8bd1\uff1a\u56de\u5230\u7f51\u9875\u8865\u7ffb\u3011";
-  const zhClass = isTranslatedSegment(segment) ? "zh" : "zh untranslated";
+    ? innerHtmlForExport(applyReaderNameToTranslationHtml(segment.translationHtml, segment))
+    : "";
+  if (type === "zh" && !translated) return "";
   return [
     "<section class=\"segpair\" id=\"" + escapeHtml(segment.id) + "\">",
     type !== "zh" ? "<p class=\"src\">" + source + "</p>" : "",
-    type !== "en" ? "<p class=\"" + zhClass + "\">" + translated + "</p>" : "",
+    type !== "en" && translated ? "<p class=\"zh\">" + translated + "</p>" : "",
     "</section>"
   ].filter(Boolean).join("\n");
+}
+
+function hasExportBodyContent(segment, type) {
+  if (!segment || isDecorativeSegment(segment)) return false;
+  if (isChapterTitleSegment(segment) || isChapterMarkerText(segment)) return false;
+  const sourceText = textOnly(segment.originalHtml || segment.originalText || "");
+  const translatedText = textOnly(segment.translationHtml || "");
+  if (type === "zh") return Boolean(translatedText);
+  if (type === "en") return Boolean(sourceText);
+  return Boolean(sourceText || translatedText);
 }
 
 function buildFrontMatterHtml(segments, type) {
@@ -2492,8 +2753,17 @@ function buildFrontMatterHtml(segments, type) {
       return "<p class=\"meta-line\">" + text + "</p>";
     }
     return buildSegPairHtml(segment, type);
-  }).join("\n");
+  }).filter(Boolean).join("\n");
   return "<section class=\"frontmatter\">\n" + rows + "\n</section>";
+}
+
+function chapterDisplayTitle(chapter) {
+  return cleanExportText(chapter?.title || "");
+}
+
+function chapterOriginalTitle(chapter, index) {
+  const title = cleanExportText(chapter?.title || "");
+  return title && title !== chapterDisplayTitle(chapter) ? title : "";
 }
 
 function applyBilingualHtml(node, translationHtml) {
@@ -2518,23 +2788,41 @@ function buildHtml(type) {
   const exportTitle = els.exportTitleInput.value.trim() || state.metadata?.title || state.fileName || "AO3 Work";
   const author = state.metadata?.author || "";
   const lang = type === "en" ? "en" : "zh-CN";
+  hydrateChapterMetadataFromRawHtml();
   const chapters = buildBooxChapters(state.segments, exportTitle);
-  const titledChapters = chapters.filter((chapter) => chapter.hasTitle);
-  const toc = titledChapters.length ? [
+  const renderedChapters = chapters
+    .map((chapter, index) => ({
+      chapter,
+      index,
+      rows: chapter.segments.map((segment) => buildSegPairHtml(segment, type)).filter(Boolean)
+    }))
+    .filter((item) => item.rows.length && item.chapter.segments.some((segment) => hasExportBodyContent(segment, type)));
+  const tocChapters = renderedChapters
+    .map((item, visibleIndex) => ({
+      ...item,
+      title: item.chapter.hasTitle ? chapterDisplayTitle(item.chapter) : ""
+    }))
+    .filter((item) => item.title);
+  const toc = tocChapters.length ? [
     '<nav id="toc" class="toc" role="doc-toc">',
     "<h2>\u76ee\u5f55</h2>",
     "<ol>",
-    ...titledChapters.map((chapter) => "<li><a href=\"#" + escapeHtml(chapter.id) + "\">" + escapeHtml(chapter.title) + "</a></li>"),
+    ...tocChapters.map(({ chapter, title }) => "<li><a href=\"#" + escapeHtml(chapter.id) + "\">" + escapeHtml(title) + "</a></li>"),
     "</ol>",
     "</nav>"
   ].join("\n") : "";
   const frontMatter = buildFrontMatterHtml(state.segments, type);
-  const chapterHtml = chapters.map((chapter) => [
-    "<section class=\"chapter\" id=\"" + escapeHtml(chapter.id) + "\">",
-    chapter.hasTitle ? "<h1 class=\"chapter-title\">" + escapeHtml(chapter.title) + "</h1>" : "",
-    chapter.segments.map((segment) => buildSegPairHtml(segment, type)).join("\n"),
-    "</section>"
-  ].filter(Boolean).join("\n")).join("\n");
+  const chapterHtml = renderedChapters.map((item, visibleIndex) => {
+    const title = item.chapter.hasTitle ? chapterDisplayTitle(item.chapter) : "";
+    const originalTitle = chapterOriginalTitle(item.chapter, visibleIndex);
+    return [
+      "<section class=\"chapter\">",
+      title ? "<h1 class=\"chapter-title\" id=\"" + escapeHtml(item.chapter.id) + "\">" + escapeHtml(title) + "</h1>" : "",
+      originalTitle ? "<p class=\"chapter-subtitle\">" + escapeHtml(originalTitle) + "</p>" : "",
+      item.rows.join("\n"),
+      "</section>"
+  ].filter(Boolean).join("\n");
+  }).filter(Boolean).join("\n");
   return [
     "<!doctype html>",
     "<html lang=\"" + lang + "\">",
@@ -2643,7 +2931,7 @@ function epubContent(type) {
     .pair{margin:1em 0 1.2em;}
     .en,.zh{display:block;margin:.35em 0;}
     .zh{font-weight:650;}
-    .zh em,.zh i{font-style:normal;font-weight:750;letter-spacing:.08em;}
+    .zh em,.zh i{font-style:normal;font-weight:750;letter-spacing:.03em;}
   </style>`;
   doc.body.innerHTML = "";
   const h1 = doc.createElement("h1");
@@ -2657,10 +2945,11 @@ function epubContent(type) {
   }
 
   for (const segment of state.segments) {
+    if (type === "zh" && !isTranslatedSegment(segment) && !isDecorativeSegment(segment)) continue;
     const wrapper = doc.createElement(segment.kind === "meta" ? "p" : "div");
     wrapper.className = segment.kind === "meta" ? "meta" : "pair";
     if (type === "en") {
-      wrapper.innerHTML = applyReaderNameToHtml(segment.originalHtml);
+      wrapper.innerHTML = applyReaderNameToHtml(segment.originalHtml, "en");
     } else if (type === "zh") {
       wrapper.innerHTML = exportTranslationHtml(segment);
     } else if (segment.kind === "meta") {
@@ -2669,7 +2958,8 @@ function epubContent(type) {
         ? `${segment.originalText} / ${translated}`
         : segment.originalText;
     } else {
-      wrapper.innerHTML = `<div class="en">${applyReaderNameToHtml(segment.originalHtml)}</div><div class="zh">${exportTranslationHtml(segment)}</div>`;
+      const translated = exportTranslationHtml(segment);
+      wrapper.innerHTML = `<div class="en">${applyReaderNameToHtml(segment.originalHtml, "en")}</div>${translated ? `<div class="zh">${translated}</div>` : ""}`;
     }
     doc.body.appendChild(wrapper);
   }
@@ -2824,8 +3114,11 @@ async function epubToHtml(file) {
   try {
     const response = await fetch("/api/epub-to-html", {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ fileName: file.name, base64: arrayBufferToBase64(buffer) })
+      headers: {
+        "content-type": "application/epub+zip",
+        "x-file-name": encodeURIComponent(file.name)
+      },
+      body: buffer
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.html) throw new Error(data.error || "EPUB import failed.");
@@ -2900,6 +3193,87 @@ async function importableFileText(file) {
     : file.text();
 }
 
+function restoreTranslationsFromWork(previousWork, nextWork) {
+  if (!previousWork?.segments?.length || !nextWork?.segments?.length) return 0;
+  const previousByKey = new Map(previousWork.segments.map((segment) => [segment.key, segment]));
+  let restored = 0;
+  for (const segment of nextWork.segments) {
+    const previous = previousByKey.get(segment.key);
+    if (!previous?.translationHtml) continue;
+    segment.translationHtml = previous.translationHtml;
+    segment.failedReason = previous.failedReason || "";
+    restored += 1;
+  }
+  return restored;
+}
+
+function sourceChapterCount(rawHtml = "") {
+  if (!rawHtml) return 0;
+  const doc = new DOMParser().parseFromString(rawHtml, "text/html");
+  const root = doc.querySelector("#chapters") || doc.body;
+  return root ? root.querySelectorAll("h1.heading, h2.heading, h3.heading, h3.title, h2.title").length : 0;
+}
+
+async function restoreOriginalChapterStructure() {
+  const work = activeWork();
+  if (!work || sourceChapterCount(work.rawHtml) > 1) return false;
+  try {
+    const response = await fetch("/api/restore-download-source", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ fileName: work.fileName })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || sourceChapterCount(data.html) <= 1) return false;
+    const previous = { segments: work.segments };
+    const previousTitle = work.exportTitle || els.exportTitleInput.value.trim();
+    work.rawHtml = data.html;
+    parseWork(work, { quiet: true });
+    const restored = restoreTranslationsFromWork(previous, work);
+    work.exportTitle = previousTitle;
+    els.exportTitleInput.value = previousTitle;
+    work.progressDone = work.segments.filter(isTranslatedSegment).length;
+    work.progressTotal = work.segments.length;
+    work.status = "Restored original chapters and kept " + restored + " translations.";
+    rebuildSegmentIndex(work);
+    syncActiveWork();
+    scheduleWorkListRender(true);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function addImportedWork(fileName, rawHtml, sizeKb = "") {
+  const existingIndex = state.works.findIndex((item) => item.fileName === fileName);
+  const previousWork = existingIndex >= 0 ? state.works[existingIndex] : null;
+  const work = {
+    fileName,
+    rawHtml,
+    metadata: null,
+    segments: [],
+    exportTitle: "",
+    selectedIds: [],
+    sizeKb,
+    progressDone: 0,
+    progressTotal: 0,
+    status: ""
+  };
+  if (existingIndex >= 0) state.works[existingIndex] = work;
+  else state.works.push(work);
+  state.currentWorkIndex = existingIndex >= 0 ? existingIndex : state.works.length - 1;
+  selectedSegmentIds.clear();
+  parseWork(work, { quiet: true });
+  const restored = restoreTranslationsFromWork(previousWork, work);
+  if (previousWork?.exportTitle) work.exportTitle = previousWork.exportTitle;
+  work.progressDone = work.segments.filter(isTranslatedSegment).length;
+  work.progressTotal = work.segments.length;
+  work.status = restored ? `Re-imported source and kept ${restored} translations.` : work.status;
+  rebuildSegmentIndex(work);
+  syncActiveWork();
+  return work;
+}
+
 async function handleFiles(files) {
   try {
     const incoming = [...(files || [])].filter(isImportableFile);
@@ -2908,26 +3282,13 @@ async function handleFiles(files) {
       return;
     }
     setStatus(`Importing ${incoming.length} file${incoming.length > 1 ? "s" : ""}...`);
-    const firstNewIndex = state.works.length;
+    let firstImportedIndex = -1;
     for (const file of incoming) {
-      const work = {
-        fileName: file.name,
-        rawHtml: await importableFileText(file),
-        metadata: null,
-        segments: [],
-        exportTitle: "",
-        selectedIds: [],
-        sizeKb: (file.size / 1024).toFixed(1),
-        progressDone: 0,
-        progressTotal: 0,
-        status: ""
-      };
-      state.works.push(work);
-      state.currentWorkIndex = state.works.length - 1;
-      selectedSegmentIds.clear();
-      parseWork(work, { quiet: true });
+      setStatus(`Importing ${file.name}...`);
+      await addImportedWork(file.name, await importableFileText(file), (file.size / 1024).toFixed(1));
+      if (firstImportedIndex < 0) firstImportedIndex = state.currentWorkIndex;
     }
-    setActiveWork(firstNewIndex);
+    setActiveWork(firstImportedIndex);
     updateFileMeta();
   } catch (error) {
     setStatus(`Import failed: ${error.message || error}`, true);
@@ -2936,11 +3297,78 @@ async function handleFiles(files) {
   }
 }
 
+async function importLocalPath() {
+  const path = els.localPathInput?.value.trim();
+  if (!path) return setStatus("Paste a local HTML or EPUB path first.", true);
+  try {
+    setStatus("Importing local file...");
+    const response = await fetch("/api/import-local-file", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.html) throw new Error(data.error || "Local import failed.");
+    await addImportedWork(data.fileName || path.split(/[\\/]/).pop() || "AO3 Work", data.html, data.sizeKb || "");
+    setActiveWork(state.currentWorkIndex);
+    updateFileMeta();
+  } catch (error) {
+    setStatus(`Import failed: ${error.message || error}`, true);
+  }
+}
+
+async function importOneFromEndpoint(url, options = {}, loadingText = "Importing file...") {
+  try {
+    setStatus(loadingText);
+    const response = await fetch(url, options);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.html) throw new Error(data.error || "Import failed.");
+    await addImportedWork(data.fileName || "AO3 Work", data.html, data.sizeKb || "");
+    setActiveWork(state.currentWorkIndex);
+    updateFileMeta();
+  } catch (error) {
+    setStatus(`Import failed: ${error.message || error}`, true);
+  }
+}
+
+async function importFolderFiles() {
+  try {
+    setStatus("Checking import folder...");
+    const listResponse = await fetch("/api/import-folder");
+    const list = await listResponse.json().catch(() => ({}));
+    if (!listResponse.ok) throw new Error(list.error || "Could not open import folder.");
+    if (els.importFolderHint) els.importFolderHint.textContent = list.folder || "";
+    const files = Array.isArray(list.files) ? list.files : [];
+    if (!files.length) {
+      setStatus(`Put .html or .epub files in: ${list.folder}`, true);
+      return;
+    }
+    let firstImportedIndex = -1;
+    for (const name of files) {
+      setStatus(`Importing ${name}...`);
+      const response = await fetch("/api/import-folder-file", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.html) throw new Error(data.error || `Could not import ${name}.`);
+      await addImportedWork(data.fileName || name, data.html, data.sizeKb || "");
+      if (firstImportedIndex < 0) firstImportedIndex = state.currentWorkIndex;
+    }
+    setActiveWork(firstImportedIndex);
+    updateFileMeta();
+  } catch (error) {
+    setStatus(`Import failed: ${error.message || error}`, true);
+  }
+}
+
 els.providerSelect.addEventListener("change", () => {
   updateAiSettings();
 });
 if (els.googleContextMode) {
-  els.googleContextMode.checked = localStorage.getItem(GOOGLE_CONTEXT_STORAGE_KEY) !== "0";
+  els.googleContextMode.checked = false;
+  localStorage.setItem(GOOGLE_CONTEXT_STORAGE_KEY, "0");
   els.googleContextMode.addEventListener("change", () => {
     localStorage.setItem(GOOGLE_CONTEXT_STORAGE_KEY, els.googleContextMode.checked ? "1" : "0");
   });
@@ -2949,6 +3377,17 @@ els.apiKeyInput.addEventListener("input", () => {
   if (els.apiKeyInput.value.trim()) els.aiSettings.hidden = true;
 });
 els.fileInput.addEventListener("change", () => handleFiles(els.fileInput.files));
+els.fileInput.addEventListener("click", () => {
+  els.fileInput.value = "";
+});
+els.latestDownloadButton?.addEventListener("click", () => {
+  importOneFromEndpoint("/api/import-latest-download", { method: "POST" }, "Importing latest download...");
+});
+els.localPathButton?.addEventListener("click", importLocalPath);
+els.localPathInput?.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") importLocalPath();
+});
+els.importFolderButton?.addEventListener("click", importFolderFiles);
 els.dropZone.addEventListener("dragover", (event) => event.preventDefault());
 els.dropZone.addEventListener("drop", (event) => {
   event.preventDefault();
@@ -2964,6 +3403,10 @@ els.workList.addEventListener("click", (event) => {
   }
   const button = event.target.closest("[data-work-index]");
   if (!button) return;
+  if (document.body.classList.contains("busy")) {
+    setStatus("Current work is translating. Wait for it to finish before switching works.", true);
+    return;
+  }
   setActiveWork(Number(button.dataset.workIndex));
 });
 els.startButton.addEventListener("click", async () => {
@@ -2974,28 +3417,43 @@ els.startButton.addEventListener("click", async () => {
     setBusy(false);
     const message = String(error.message || "Translation failed.");
     setStatus(message.includes("Google")
-      ? "Google 还是没接住。先别刷新，等 30 秒再点 Start translate；我会只补没翻完的段落。若连续失败，多半是代理/Google 临时限流，不是文章丢了。"
+      ? "Google did not respond. Wait a bit and click Start translate again; only missing paragraphs will retry."
       : message, true);
   }
 });
+if (els.stopButton) {
+  els.stopButton.addEventListener("click", () => {
+    translationStopRequested = true;
+    bulkTranslateMode = false;
+    setStatus("Stopping after the current Google batch returns...");
+  });
+}
+if (els.startAllButton) {
+  els.startAllButton.addEventListener("click", async () => {
+    try {
+      await translateAllWorks();
+    } catch (error) {
+      bulkTranslateMode = false;
+      setBusy(false);
+      updateReady();
+      setStatus(error.message || "Batch translate failed.", true);
+    }
+  });
+}
+if (els.doubaoMissingButton) {
+  els.doubaoMissingButton.addEventListener("click", async () => {
+    revealKeySettings("doubao");
+    setStatus("Doubao is available after API key / quota is ready. Full translation uses Google for now.", true);
+  });
+}
 els.polishButton.addEventListener("click", async () => {
-  try {
-    await polishChinese("deepseek");
-  } catch (error) {
-    els.polishButton.disabled = false;
-    setBusy(false);
-    setStatus(error.message || "Polish failed.", true);
-  }
+  revealKeySettings("deepseek");
+  setStatus("AI polish is available after API key / quota is ready.", true);
 });
 if (els.doubaoPolishButton) {
   els.doubaoPolishButton.addEventListener("click", async () => {
-    try {
-      await doubaoRewriteSelected();
-    } catch (error) {
-      els.doubaoPolishButton.disabled = false;
-      setBusy(false);
-      setStatus(error.message || "Doubao rewrite failed.", true);
-    }
+    revealKeySettings("doubao");
+    setStatus("Doubao rewrite is available after API key / quota is ready.", true);
   });
 }
 if (els.clearTranslationsButton) {
@@ -3013,11 +3471,16 @@ if (els.applyReaderNameButton) {
     }
     syncActiveWork();
     schedulePreviewRender(true);
-    setStatus(readerName() ? "Y/N name applied to preview and exports." : "Y/N name cleared.");
+    setStatus((readerNameZh() || readerNameEn()) ? "Y/N names applied to preview and exports." : "Y/N names cleared.");
   });
 }
 if (els.readerNameInput) {
   els.readerNameInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && els.applyReaderNameButton) els.applyReaderNameButton.click();
+  });
+}
+if (els.readerNameEnInput) {
+  els.readerNameEnInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && els.applyReaderNameButton) els.applyReaderNameButton.click();
   });
 }
@@ -3044,16 +3507,36 @@ els.preview.addEventListener("input", (event) => {
   if (segment) {
     segment.translationHtml = event.target.closest(".zh").innerHTML;
     segment.failedReason = isTranslatedSegment(segment) ? "" : "untranslated";
-    syncActiveWork();
-    setProgress(activeWork()?.progressDone || 0, activeWork()?.progressTotal || state.segments.length);
-    updateReady();
+    if (previewEditSaveTimer) clearTimeout(previewEditSaveTimer);
+    previewEditSaveTimer = window.setTimeout(() => {
+      const progress = recalculateWorkProgress(activeWork());
+      setProgress(progress.done, progress.total);
+      syncActiveWork();
+      updateReady();
+    }, 900);
   }
 });
+
+els.preview.addEventListener("blur", (event) => {
+  if (!event.target.closest?.(".zh")) return;
+  if (previewEditSaveTimer) clearTimeout(previewEditSaveTimer);
+  previewEditSaveTimer = 0;
+  const progress = recalculateWorkProgress(activeWork());
+  setProgress(progress.done, progress.total);
+  syncActiveWork();
+  updateReady();
+}, true);
 els.preview.addEventListener("click", (event) => {
+  const retryButton = event.target.closest("[data-retry-segment]");
+  if (retryButton) {
+    const pair = retryButton.closest(".pair");
+    if (!pair) return;
+    void translateOneSegment(pair.dataset.id, retryButton.dataset.retrySegment);
+    return;
+  }
   const missingButton = event.target.closest("[data-preview-missing]");
   if (missingButton) {
     state.previewMissingOnly = !state.previewMissingOnly;
-    state.previewAll = state.previewMissingOnly ? true : state.previewAll;
     state.previewVisibleCount = PREVIEW_LIMIT;
     updateReady();
     schedulePreviewRender(true);
@@ -3061,11 +3544,7 @@ els.preview.addEventListener("click", (event) => {
   }
   const moreButton = event.target.closest("[data-preview-more]");
   if (!moreButton) return;
-  state.previewVisibleCount = Math.min(
-    state.segments.length,
-    (state.previewVisibleCount || PREVIEW_LIMIT) + PREVIEW_PAGE_SIZE
-  );
-  schedulePreviewRender(true);
+  extendPreviewPage();
 });
 els.preview.addEventListener("change", (event) => {
   if (!event.target.classList.contains("segment-select")) return;
@@ -3085,14 +3564,16 @@ els.modeButtons.forEach((button) => {
   });
 });
 els.exportButtons.forEach((button) => {
-  button.addEventListener("click", () => {
+  button.addEventListener("click", async () => {
+    await restoreOriginalChapterStructure();
     const type = button.dataset.export;
     const suffix = type === "bilingual" ? "bilingual" : type === "zh" ? "zh" : "en";
     download(`${safeBase()} ${suffix}.html`, buildHtml(type));
   });
 });
 els.epubButtons.forEach((button) => {
-  button.addEventListener("click", () => {
+  button.addEventListener("click", async () => {
+    await restoreOriginalChapterStructure();
     const type = button.dataset.epub;
     const suffix = type === "bilingual" ? "bilingual" : type === "zh" ? "zh" : "en";
     downloadBlob(`${safeBase()} ${suffix}.epub`, buildEpub(type));
@@ -3100,15 +3581,37 @@ els.epubButtons.forEach((button) => {
 });
 if (els.togglePreviewButton) {
   els.togglePreviewButton.addEventListener("click", () => {
-    state.previewAll = !state.previewAll;
-    state.previewVisibleCount = state.previewAll ? Math.max(state.previewVisibleCount || PREVIEW_LIMIT, PREVIEW_LIMIT) : PREVIEW_LIMIT;
+    extendPreviewPage();
     updateReady();
-    schedulePreviewRender(true);
   });
 }
 
+window.addEventListener("scroll", () => {
+  window.requestAnimationFrame(maybeExtendPreviewOnScroll);
+}, { passive: true });
+
+document.documentElement.dataset.appJsBottom = "reached";
 loadSavedGlossary();
 loadReaderName();
+if (new URLSearchParams(window.location.search).get("autoImport") === "latest") {
+  window.setTimeout(() => {
+    importOneFromEndpoint("/api/import-latest-download", { method: "POST" }, "Importing latest download...");
+  }, 200);
+}
+const embeddedAutoWork = $("#autoWorkJson")?.value;
+if (embeddedAutoWork || window.__AUTO_IMPORT_WORK__) {
+  void (async () => {
+    try {
+      const work = embeddedAutoWork ? JSON.parse(embeddedAutoWork) : window.__AUTO_IMPORT_WORK__;
+    setStatus(`Importing ${work.fileName || "latest download"}...`);
+    await addImportedWork(work.fileName || "AO3 Work", work.html || "", work.sizeKb || "");
+    setActiveWork(state.currentWorkIndex);
+    updateFileMeta();
+    } catch (error) {
+      setStatus(`Embedded import failed: ${error.message || error}`, true);
+    }
+  })();
+}
 restoreSavedSession().then((restored) => {
   if (!restored) updateReady();
 }).finally(() => {

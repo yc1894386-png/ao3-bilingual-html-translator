@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: ao3-bilingual-html-translator
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health

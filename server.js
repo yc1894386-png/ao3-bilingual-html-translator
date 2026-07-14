@@ -1,7 +1,7 @@
 import http from "node:http";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,8 +11,10 @@ import { inflateRawSync } from "node:zlib";
 const execFileAsync = promisify(execFile);
 const appRoot = fileURLToPath(new URL("./", import.meta.url));
 const root = fileURLToPath(new URL("./public", import.meta.url));
+const importFolder = normalize(fileURLToPath(new URL("../ao3-imports", import.meta.url)));
+const downloadsFolder = normalize(join(process.env.USERPROFILE || "C:\\Users\\Administrator", "Downloads"));
 const port = Number(process.env.PORT || 4191);
-const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "http://127.0.0.1:7897";
+const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || (process.platform === "win32" ? "http://127.0.0.1:7897" : "");
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -72,7 +74,7 @@ function shouldUseProxy(url, options = {}) {
   if (options.proxy === false) return false;
   if (host.includes("deepseek")) return false;
   if (host.includes("volces.com")) return false;
-  return true;
+  return Boolean(proxyUrl);
 }
 
 function sendText(res, status, value) {
@@ -95,6 +97,13 @@ function readJsonBody(req) {
     });
     req.on("end", () => {
       try {
+        const contentType = String(req.headers["content-type"] || "");
+        if (contentType.includes("application/x-www-form-urlencoded")) {
+          const params = new URLSearchParams(body);
+          const json = params.get("body") || "";
+          resolve(json.trim() ? JSON.parse(json) : {});
+          return;
+        }
         resolve(body.trim() ? JSON.parse(body) : {});
       } catch {
         reject(new Error("Invalid request body."));
@@ -104,7 +113,44 @@ function readJsonBody(req) {
   });
 }
 
+function readBufferBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", (chunk) => {
+      chunks.push(chunk);
+      size += chunk.length;
+      if (size > 80 * 1024 * 1024) {
+        reject(new Error("File is too large."));
+        req.destroy();
+      }
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
 async function curlText(url, options = {}) {
+  if (process.platform !== "win32") {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), (options.timeout || 60) * 1000);
+    try {
+      const response = await fetch(url, {
+        method: options.body === undefined ? "GET" : "POST",
+        headers: options.headers || {},
+        body: options.body,
+        signal: controller.signal
+      });
+      const text = await response.text();
+      if (!response.ok) throw new Error(`HTTP ${response.status}: ${text.slice(0, 300)}`);
+      return text;
+    } catch (error) {
+      throw networkErrorFor(url, error);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   const args = ["-L", "--max-time", String(options.timeout || 60), "-s", url];
   if (shouldUseProxy(url, options)) args.splice(1, 0, "--proxy", proxyUrl);
   for (const [name, value] of Object.entries(options.headers || {})) {
@@ -289,6 +335,27 @@ function epubBufferToHtml(buffer, fileName = "AO3 Work") {
   ].join("\n");
 }
 
+async function readImportFile(filePath, fileName) {
+  const buffer = await readFile(filePath);
+  const html = /\.epub$/i.test(fileName) ? epubBufferToHtml(buffer, fileName) : buffer.toString("utf8");
+  return { html, fileName, sizeKb: (buffer.length / 1024).toFixed(1) };
+}
+
+async function latestDownloadWork() {
+  const entries = await readdir(downloadsFolder, { withFileTypes: true });
+  const candidates = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !/\.(epub|xhtml|html|htm)$/i.test(entry.name)) continue;
+    const filePath = normalize(join(downloadsFolder, entry.name));
+    const info = await stat(filePath);
+    candidates.push({ name: entry.name, filePath, mtimeMs: info.mtimeMs });
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const latest = candidates[0];
+  if (!latest) throw new Error(`No HTML or EPUB found in ${downloadsFolder}.`);
+  return readImportFile(latest.filePath, latest.name);
+}
+
 function applyGlossaryText(text, glossary = []) {
   let output = text;
   for (const item of sortedGlossary(glossary)) {
@@ -334,7 +401,7 @@ function shouldProtectGlossaryItem(item, mode = "body") {
   const target = usableGlossaryTarget(item);
   if (!source || !target) return false;
   if (mode === "meta") return true;
-  if (/^(Alpha|Beta|Omega|Heat|Rut|Reader|You|POV|Plot|Praise|Comfort|Blood|Injury|Violence|English|Words|Chapters|Comments|Kudos|Bookmarks|Hits)$/i.test(source)) return false;
+  if (/^(Heat|Rut|Reader|You|POV|Plot|Praise|Comfort|Blood|Injury|Violence|English|Words|Chapters|Comments|Kudos|Bookmarks|Hits)$/i.test(source)) return false;
   if (/^[A-Za-z][A-Za-z.'-]{2,}(?:\s+[A-Za-z][A-Za-z.'-]*)*$/.test(source)) return true;
   return source.length >= 5;
 }
@@ -385,7 +452,7 @@ async function translateWithGoogleHtmlAttempt(items, from = "en", to = "zh-CN", 
   const sourceTexts = protectedItems.map((item) => item.html);
   const payload = JSON.stringify([[sourceTexts, from, to], "te"]);
   const raw = await curlText("https://translate-pa.googleapis.com/v1/translateHtml", {
-    timeout: 60,
+    timeout: 25,
     headers: {
       "X-goog-api-key": key,
       "Content-Type": "application/json+protobuf",
@@ -495,7 +562,7 @@ async function translateWithGoogleHtmlDocumentChunk(items, from = "en", to = "zh
   }).join("\n");
   const payload = JSON.stringify([[[combinedHtml], from, to], "te"]);
   const raw = await curlText("https://translate-pa.googleapis.com/v1/translateHtml", {
-    timeout: 70,
+    timeout: 30,
     headers: {
       "X-goog-api-key": key,
       "Content-Type": "application/json+protobuf",
@@ -538,7 +605,7 @@ function restoreSimpleGlossaryTerms(html = "", glossary = []) {
     if (!source || !target) continue;
     if (/keep as-is|\u4e0d\u7ffb\u8bd1|context|voice|tone|by /i.test(target)) continue;
     if (!/[A-Za-z]/.test(source)) continue;
-    if (/^(You|Reader|Alpha|Beta|Omega|Heat|Rut|Plot|Blood|Injury|Violence)$/i.test(source)) continue;
+    if (/^(You|Reader|Heat|Rut|Plot|Blood|Injury|Violence)$/i.test(source)) continue;
     const pattern = new RegExp(`\\b${source.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "g");
     output = output.replace(pattern, target);
   }
@@ -577,6 +644,25 @@ async function doubaoApiKey(inputKey = "") {
   return localEnv.DOUBAO_API_KEY || localEnv.ARK_API_KEY || "";
 }
 
+function aiContextDisciplinePrompt(task = "translate") {
+  const common = [
+    "Read the ordered Segments array as local scene context, but return each id independently.",
+    "Return exactly one item per input id, with the same ids and same order.",
+    "Do not merge, split, skip, summarize, reorder, or move content between ids.",
+    "Use context only to keep names, tone, continuity, and terminology consistent.",
+    "Do not invent subjects, pronouns, character names, relationships, emotions, motives, or actions.",
+    "If the English leaves a subject ambiguous, keep the Chinese wording ambiguous.",
+    "Do not turn he/she/they/you/I into a character name unless that name appears in the source segment or is absolutely explicit from immediate context."
+  ];
+  if (task === "polish") {
+    common.push("For proofreading, preserve the existing translation unless there is a clear mistranslation, terminology issue, grammar issue, or awkward machine-translation phrase.");
+  }
+  if (task === "rewrite") {
+    common.push("For selected retranslation, translate only the selected id; before/after are context and must not be copied into the result.");
+  }
+  return common.join("\n");
+}
+
 function aiSystemPrompt(task = "translate") {
   if (task === "title") {
     return [
@@ -594,7 +680,7 @@ function aiSystemPrompt(task = "translate") {
       "中文要像同人小说正文，人物语气自然；只做必要顺句，不要大幅美化或扩写。",
       "保留段落边界和简单 HTML 标签。严格遵守术语表。",
       "只返回 JSON 数组：[{\"id\":\"...\",\"html\":\"...\"}]，html 只包含重翻后的中文 HTML。"
-    ].join("\n");
+    ].join("\n") + "\n" + aiContextDisciplinePrompt(task);
   }
   if (task === "polish") {
     return [
@@ -603,7 +689,7 @@ function aiSystemPrompt(task = "translate") {
       "参考英文原文判断语气和含义；before/after 只作上下文参考，不要写进当前段落。",
       "保持原段落边界、亲密程度、节奏、标点风格和简单 HTML 标签。禁止扩写、删减、总结、审查或新增描写。",
       "严格遵守术语表。只返回 JSON 数组：[{\"id\":\"...\",\"html\":\"...\"}]，html 只包含润色后的中文 HTML。"
-    ].join("\n");
+    ].join("\n") + "\n" + aiContextDisciplinePrompt(task);
   }
   return [
     "你是熟悉 AO3 同人语境的英文小说译者，负责英译中。",
@@ -612,7 +698,7 @@ function aiSystemPrompt(task = "translate") {
     "忠于原文意思、动作、心理、对话、句序、段落边界和简单 HTML 标签；不要改写、美化、扩写、总结、删减、审查或新增细节。",
     "中文要像同人小说正文，不要说明书腔、字幕腔、报告腔。严格遵守术语表。",
     "只返回 JSON 数组：[{\"id\":\"...\",\"html\":\"...\"}]，html 只包含该 id 对应段落的中文 HTML。"
-  ].join("\n");
+  ].join("\n") + "\n" + aiContextDisciplinePrompt(task);
 }
 
 async function translateWithAICompatibleClean(items, options = {}) {
@@ -625,10 +711,10 @@ async function translateWithAICompatibleClean(items, options = {}) {
   if (!apiKey) throw new Error("API key is required.");
 
   const task = options.task || "translate";
-  const promptItems = items.map((item) => {
+  const promptItems = items.map((item, index) => {
     const entry = task === "polish" || task === "rewrite"
-      ? { id: item.id, source: item.source || "", current: item.current || item.html || "" }
-      : { id: item.id, text: item.text || "", html: item.html };
+      ? { order: index + 1, id: item.id, source: item.source || "", current: item.current || item.html || "" }
+      : { order: index + 1, id: item.id, text: item.text || "", html: item.html };
     if (item.before) entry.before = String(item.before).slice(-900);
     if (item.after) entry.after = String(item.after).slice(0, 500);
     return entry;
@@ -643,6 +729,8 @@ async function translateWithAICompatibleClean(items, options = {}) {
         role: "user",
         content: [
           `Glossary:\n${glossaryPrompt(options.glossary)}`,
+          "The following Segments are nearby paragraphs in reading order. Use the group for context, but produce separate results per id.",
+          "Output must be JSON only: [{\"id\":\"same id\",\"html\":\"Chinese HTML for that id only\"}].",
           "Segments:",
           JSON.stringify(promptItems)
         ].join("\n\n")
@@ -716,12 +804,73 @@ const server = http.createServer(async (req, res) => {
         hasDoubaoKey: Boolean(await doubaoApiKey(""))
       });
     }
+    if (req.method === "GET" && url.pathname === "/auto-latest") {
+      const indexPath = join(root, "index.html");
+      const indexHtml = await readFile(indexPath, "utf8");
+      const work = await latestDownloadWork();
+      const payload = escapeHtml(JSON.stringify(work));
+      const html = indexHtml.replace("<body>", `<body><textarea id="autoWorkJson" hidden>${payload}</textarea>`);
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      return res.end(html);
+    }
+    if (req.method === "GET" && url.pathname === "/auto-work.js") {
+      const work = await latestDownloadWork();
+      const payload = Buffer.from(JSON.stringify(work), "utf8").toString("base64");
+      res.writeHead(200, { "content-type": "application/javascript; charset=utf-8" });
+      return res.end(`window.__AUTO_IMPORT_WORK__=JSON.parse(decodeURIComponent(escape(atob("${payload}"))));`);
+    }
     if (req.method === "POST" && url.pathname === "/api/epub-to-html") {
-      const body = await readJsonBody(req);
-      const base64 = String(body.base64 || "");
-      if (!base64) return sendJson(res, 400, { error: "No EPUB file received." });
-      const html = epubBufferToHtml(Buffer.from(base64, "base64"), String(body.fileName || "AO3 Work"));
+      const contentType = String(req.headers["content-type"] || "");
+      let buffer;
+      let fileName = "AO3 Work";
+      if (contentType.includes("application/json")) {
+        const body = await readJsonBody(req);
+        const base64 = String(body.base64 || "");
+        if (!base64) return sendJson(res, 400, { error: "No EPUB file received." });
+        buffer = Buffer.from(base64, "base64");
+        fileName = String(body.fileName || fileName);
+      } else {
+        buffer = await readBufferBody(req);
+        fileName = decodeURIComponent(String(req.headers["x-file-name"] || fileName));
+      }
+      if (!buffer.length) return sendJson(res, 400, { error: "No EPUB file received." });
+      const html = epubBufferToHtml(buffer, fileName);
       return sendJson(res, 200, { html });
+    }
+    if (req.method === "POST" && url.pathname === "/api/import-local-file") {
+      const body = await readJsonBody(req);
+      const filePath = normalize(String(body.path || "").trim().replace(/^["']|["']$/g, ""));
+      if (!filePath) return sendJson(res, 400, { error: "No file path received." });
+      if (!/\.(epub|xhtml|html|htm)$/i.test(filePath)) return sendJson(res, 400, { error: "Please choose an HTML or EPUB file." });
+      const fileName = filePath.split(/[\\/]/).pop() || "AO3 Work";
+      return sendJson(res, 200, await readImportFile(filePath, fileName));
+    }
+    if (req.method === "POST" && url.pathname === "/api/restore-download-source") {
+      const body = await readJsonBody(req);
+      const fileName = String(body.fileName || "").trim();
+      if (!/^[^\\/]+\.(epub|xhtml|html|htm)$/i.test(fileName)) return sendJson(res, 400, { error: "Original file name is unavailable." });
+      const filePath = normalize(join(downloadsFolder, fileName));
+      return sendJson(res, 200, await readImportFile(filePath, fileName));
+    }
+    if (req.method === "GET" && url.pathname === "/api/import-folder") {
+      await mkdir(importFolder, { recursive: true });
+      const entries = await readdir(importFolder, { withFileTypes: true });
+      const files = entries
+        .filter((entry) => entry.isFile() && /\.(epub|xhtml|html|htm)$/i.test(entry.name))
+        .map((entry) => entry.name);
+      return sendJson(res, 200, { folder: importFolder, files });
+    }
+    if (req.method === "POST" && url.pathname === "/api/import-folder-file") {
+      await mkdir(importFolder, { recursive: true });
+      const body = await readJsonBody(req);
+      const name = String(body.name || "");
+      if (!/^[^\\/]+\.(epub|xhtml|html|htm)$/i.test(name)) return sendJson(res, 400, { error: "Please choose an HTML or EPUB file." });
+      const filePath = normalize(join(importFolder, name));
+      if (!filePath.startsWith(importFolder)) return sendJson(res, 403, { error: "File is outside the import folder." });
+      return sendJson(res, 200, await readImportFile(filePath, name));
+    }
+    if (req.method === "POST" && url.pathname === "/api/import-latest-download") {
+      return sendJson(res, 200, await latestDownloadWork());
     }
     if (req.method === "POST" && url.pathname === "/api/translate") {
       const body = await readJsonBody(req);
